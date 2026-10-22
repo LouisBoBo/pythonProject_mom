@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dsh-mom"
+version = "0.1.0"
+description = "AI application that embeds DeepSeek Harness as its agent backend."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "deepseek-harness-sdk>=0.2.1rc2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+dsh-mom = "dsh_mom.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dsh_mom"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

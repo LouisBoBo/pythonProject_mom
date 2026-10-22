@@ -1,0 +1,14 @@
+.venv/
+vendor/dsh/node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.env
+.tmp/
+var/
+.codex-tasks/

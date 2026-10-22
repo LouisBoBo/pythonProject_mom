@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "Official dsh CLI matching deepseek-harness-sdk 0.2.1rc2. Native modules stay on disk so Windows can load node-pty.",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.1-rc.2"
+  }
+}
