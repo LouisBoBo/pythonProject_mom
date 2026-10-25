@@ -1,0 +1,32 @@
+<svg width="472" height="40" viewBox="0 0 472 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+<style>
+  :root {
+    --dsw-alias-label-primary: #0f1115;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --dsw-alias-label-primary: #f9fafb;
+    }
+  }
+</style>
+<g transform="translate(0 2) scale(0.5625)">
+  <g fill="none" stroke-linecap="butt" stroke-linejoin="round">
+    <path
+      d="M40.5 11.5
+         C 22 11.5 11.5 22 11.5 32
+         S 22 52.5 40.5 52.5"
+      stroke="#E31C24"
+      stroke-width="12"
+    />
+    <path
+      d="M41 18.5
+         C 47.5 18.5 52.5 24.5 52.5 32
+         S 47.5 45.5 41 45.5"
+      stroke="var(--dsw-alias-label-primary)"
+      stroke-width="11"
+    />
+  </g>
+  <circle cx="45.5" cy="12" r="5.5" fill="var(--dsw-alias-label-primary)"/>
+</g>
+<text x="48" y="27" fill="var(--dsw-alias-label-primary)" font-family="Microsoft YaHei UI, PingFang SC, sans-serif" font-size="20" font-weight="600">江西中软工作助手</text>
+</svg>

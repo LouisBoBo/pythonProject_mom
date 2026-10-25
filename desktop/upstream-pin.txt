@@ -1,0 +1,3 @@
+tag=dsh-v0.2.1-rc.2
+commit=687f282e8625c6b8d11ff58211a90524be2e4317
+url=https://github.com/deepseek-ai/deepseek-harness.git

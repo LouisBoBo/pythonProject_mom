@@ -5,38 +5,20 @@ alwaysApply: true
 
 # 桌面打包怎么选命令
 
-Windows 未签名安装包的完整命令是 `C:\dsh-src\apps\desktop` 下的 `pnpm run package:win:x64:unsigned`。它会重编整个仓库、重打运行时、跑冒烟，再打 NSIS，大约 20 分钟以上。
-
-先看这次改了什么，再选一条。交付物仍要落到本仓库 `dist/`。
-
-## 只改桌面壳
-
-改动只在 `C:\dsh-src\apps\desktop` 的壳（`src/`、安装器、图标），并且 `.desktop-build\targets\win-x64` 里已有 `dsh` 和 `runtime`。
-
-在 `C:\dsh-src\apps\desktop` 执行：
+Windows 未签名安装包只从本仓库执行：
 
 ```powershell
-pnpm run build
-$env:DSH_DESKTOP_UNSIGNED = '1'
-$env:DSH_DESKTOP_TARGET_PLATFORM = 'win32'
-$env:DSH_DESKTOP_TARGET_ARCH = 'x64'
-pnpm exec electron-builder --config electron-builder.config.mjs --win --x64 --publish never
+powershell -File desktop\package-windows.ps1
 ```
 
-然后把 `unsigned-artifacts\zr-dsh-*-win-x64-unsigned.exe` 复制到本仓库 `dist/`。不要再跑 `package:win:x64:unsigned`，也不要跑 `smoke-packaged-runtime`。
+这条命令会下载官方壳、套上 `desktop/shell`、执行官方 `package:win:x64:unsigned`，并把 `zr-dsh-*-win-x64-unsigned.exe` 复制到本仓库 `dist/`。官方整包会重编仓库、重打运行时、跑冒烟，再打 NSIS，大约 20 分钟以上。
 
-## 改了运行时
+`C:\dsh-src` 里的 `package:win:x64:unsigned` 在打包前也会再套一次 `desktop/shell`。没有本仓库链接时，这条官方命令会停下来，不会打出官方原版登录界面。不要单独跑 `electron-builder` 或 `pnpm run package:win:x64:unsigned` 来绕过 `desktop\package-windows.ps1`。
 
-改了 `C:\dsh-src\packages`、`apps\desktop-host`、`apps\web`、`apps\cli`、`native`、`vendor`，或目标目录里还没有 `dsh` / `runtime`。这时才跑：
-
-```powershell
-pnpm run package:win:x64:unsigned
-```
-
-完成后再复制到 `dist/`。
+改壳之前先运行 `desktop/shell-sync.ps1 -Mode apply`。改完并验证后运行 `-Mode capture`，把同一批文件收回本仓库。不要只把改动留在 `C:\dsh-src`。
 
 ## 禁止
 
-- 桌面壳改动却启动整包。
+- 未运行 `desktop\package-windows.ps1` 就启动桌面打包。
 - 安装包已经打好、源码没变，只为了交到 `dist/` 而重新打包。
-- 未说明这次走的是「只打安装包」还是「整包」就开始打包。
+- 未说明这次走的是本仓库这条打包命令就开始打包。

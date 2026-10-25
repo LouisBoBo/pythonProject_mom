@@ -1,0 +1,26 @@
+---
+description: 改完桌面壳必须同步回 desktop/shell
+alwaysApply: true
+---
+
+# 桌面壳改动同步
+
+`C:\dsh-src` 里的桌面壳改动，以本仓库 `desktop/shell` 为准。两边必须一致。
+
+凡是改了 `C:\dsh-src` 里属于本产品的壳文件，在结束这次改动之前执行：
+
+```powershell
+powershell -File desktop\shell-sync.ps1 -Mode capture
+```
+
+## 必须
+
+- 改动的路径已经写在 `desktop/shell-manifest.txt` 里。新文件先追加到清单，再执行 `capture`。
+- `capture` 成功之后，`desktop/shell` 里对应文件和 `C:\dsh-src` 内容相同。
+- 向用户说明壳改动时，同时说明已经收回 `desktop/shell`。
+
+## 禁止
+
+- 只改 `C:\dsh-src`，不执行 `capture` 就结束。
+- 清单之外的新文件留在 `C:\dsh-src`，却宣称已经同步。
+- 把 `desktop-test-home` 或本机测试残留写进清单。
