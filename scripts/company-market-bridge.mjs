@@ -7,14 +7,18 @@
  * each plugin's own repository — do not patch plugin code from this repo.
  */
 import { createServer } from 'node:http'
+import { Readable } from 'node:stream'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const CATALOG = process.env.ZR_DSH_MARKET_CATALOG ?? 'http://175.178.238.31/dsh-plugins/plugins.json'
 const NPM = (process.env.ZR_DSH_MARKET_NPM ?? 'http://175.178.238.31/dsh-plugins/npm/').replace(/\/?$/, '/')
+const PUBLIC_NPM = (process.env.ZR_DSH_MARKET_PUBLIC_NPM ?? 'https://registry.npmmirror.com/').replace(/\/?$/, '/')
 const HOST = process.env.ZR_DSH_MARKET_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.ZR_DSH_MARKET_PORT ?? '13090')
+/** Registry the desktop installer asks. Company packages stay on NPM; every other dependency is fetched from PUBLIC_NPM. */
+const LOCAL_NPM = `http://${HOST}:${PORT}/npm/`
 const OUT = process.env.ZR_DSH_MARKET_OUT
   ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'var', 'company-market', 'index.json')
 
@@ -53,6 +57,75 @@ export function packageRegistryUrl(registry, name) {
   const url = new URL(encoded, base.href.endsWith('/') ? base.href : `${base.href}/`)
   if (url.origin !== base.origin) throw new Error('package URL left the registry')
   return url.href
+}
+
+/**
+ * Where one installer request under `/npm/` is fetched.
+ * `@zhongruan` packages stay on the company registry. Everything else goes to the public registry,
+ * because a market install passes this bridge as pnpm's only `--registry`.
+ * @param {string} requestPath pathname beginning with `/npm/`, still percent-encoded
+ * @param {string} companyRegistry
+ * @param {string} publicRegistry
+ * @returns {string} absolute upstream URL
+ */
+export function npmProxyTarget(requestPath, companyRegistry = NPM, publicRegistry = PUBLIC_NPM) {
+  if (!requestPath.startsWith('/npm/')) throw new Error('rejected npm path')
+  const suffix = requestPath.slice('/npm/'.length)
+  if (suffix === '' || suffix.includes('..') || suffix.includes('\\') || suffix.startsWith('/')) {
+    throw new Error('rejected npm path')
+  }
+  let decoded
+  try { decoded = decodeURIComponent(suffix) } catch { throw new Error('rejected npm path') }
+  if (decoded.includes('..') || decoded.includes('\\') || decoded.startsWith('/')) throw new Error('rejected npm path')
+  const base = decoded.startsWith('@zhongruan/') ? companyRegistry : publicRegistry
+  const root = new URL(base.endsWith('/') ? base : `${base}/`)
+  const target = new URL(suffix, root)
+  if (target.origin !== root.origin || !target.pathname.startsWith(root.pathname)) {
+    throw new Error('rejected npm path')
+  }
+  return target.href
+}
+
+function blockedRedirectHost(hostname) {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true
+  if (host === '::1' || host === '0.0.0.0') return true
+  if (host.includes(':')) {
+    return host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd') || host.startsWith('::ffff:127.') || host.startsWith('::ffff:10.') || host.startsWith('::ffff:192.168.') || host.startsWith('::ffff:169.254.') || host.startsWith('::ffff:0.')
+  }
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
+  if (match === null) return false
+  const parts = match.slice(1).map(Number)
+  if (parts.some(part => part > 255)) return true
+  const a = parts[0]
+  const b = parts[1]
+  if (a === 0 || a === 10 || a === 127) return true
+  if (a === 169 && b === 254) return true
+  if (a === 172 && b >= 16 && b <= 31) return true
+  if (a === 192 && b === 168) return true
+  return false
+}
+
+/** Redirect target an installer may follow. Private, loopback, and non-http locations are rejected. */
+export function publicRedirectUrl(location, current) {
+  const url = new URL(location, current)
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('rejected redirect')
+  if (url.username || url.password) throw new Error('rejected redirect')
+  if (blockedRedirectHost(url.hostname)) throw new Error('rejected redirect')
+  return url.href
+}
+
+async function fetchPublic(target, accept) {
+  let current = target
+  for (let hop = 0; hop < 5; hop += 1) {
+    const upstream = await fetch(current, { headers: { accept }, redirect: 'manual' })
+    if (upstream.status < 300 || upstream.status >= 400) return upstream
+    const location = upstream.headers.get('location')
+    await upstream.body?.cancel()
+    if (!location) return upstream
+    current = publicRedirectUrl(location, current)
+  }
+  throw new Error('rejected redirect')
 }
 
 /** http(s) link safe to publish, or undefined when the catalog value is not one. */
@@ -138,7 +211,7 @@ async function buildIndex() {
       versions: [{
         version,
         publishTimestamp: publishSeconds(meta.time?.[version] ?? row.added),
-        source: { type: 'npm', registry: NPM },
+        source: { type: 'npm', registry: LOCAL_NPM },
         engines: { dsh: enginesDsh },
       }],
     })
@@ -194,7 +267,21 @@ if (invokedDirectly) {
     }
     if (req.method === 'GET' && path === '/health') {
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, catalog: CATALOG, npm: NPM }))
+      res.end(JSON.stringify({ ok: true, catalog: CATALOG, npm: NPM, publicNpm: PUBLIC_NPM, installRegistry: LOCAL_NPM }))
+      return
+    }
+    if (req.method === 'GET' && path.startsWith('/npm/')) {
+      const target = npmProxyTarget(path)
+      const upstream = await fetchPublic(target, req.headers.accept ?? '*/*')
+      res.writeHead(upstream.status, {
+        'content-type': upstream.headers.get('content-type') ?? 'application/octet-stream',
+        'cache-control': 'no-store',
+      })
+      if (upstream.body === null) {
+        res.end()
+        return
+      }
+      Readable.fromWeb(upstream.body).pipe(res)
       return
     }
     res.writeHead(404)

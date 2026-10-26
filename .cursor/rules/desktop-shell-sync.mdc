@@ -5,7 +5,7 @@ alwaysApply: true
 
 # 桌面壳改动同步
 
-`C:\dsh-src` 里的桌面壳改动，以本仓库 `desktop/shell` 为准。两边必须一致。
+`C:\dsh-src`（macOS 打包目录是 `~/dsh-src`）里的桌面壳改动，以本仓库 `desktop/shell` 为准。两边必须一致。
 
 凡是改了 `C:\dsh-src` 里属于本产品的壳文件，在结束这次改动之前执行：
 

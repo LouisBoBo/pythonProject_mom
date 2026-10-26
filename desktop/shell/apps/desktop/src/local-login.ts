@@ -168,10 +168,10 @@ export function submitLocalLogin(directory: string, input: LoginInput, now = Dat
   const store = readStore(directory)
   if (store.kind === 'corrupt') return { ok: false, code: 'unreadable', detail: '登录数据无法读取' }
   if (store.kind === 'missing' || store.users.length === 0) {
+    if (password.length < 8) return { ok: false, code: 'weak_password', detail: '密码至少 8 位' }
     if (!USERNAME_PATTERN.test(username)) {
       return { ok: false, code: 'invalid_username', detail: '账号须以字母开头，仅含小写字母、数字、下划线或连字符' }
     }
-    if (password.length < 8) return { ok: false, code: 'weak_password', detail: '密码至少 8 位' }
     const user: StoredUser = { username, displayName: username, role: 'admin', passwordHash: hashPassword(password) }
     mkdirSync(directory, { recursive: true })
     replaceFile(usersPath(directory), `${JSON.stringify({ users: [user] })}\n`)

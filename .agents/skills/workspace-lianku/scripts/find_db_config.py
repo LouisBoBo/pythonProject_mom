@@ -25,10 +25,40 @@ SKIP_DIRS = {
     "vendor",
     "__pycache__",
     ".desktop-build",
+    ".pnpm-store",
     "var",
 }
-MAX_DEPTH = 6
-MAX_FILES = 400
+TEXT_SUFFIXES = {
+    ".py",
+    ".pyi",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".vue",
+    ".java",
+    ".kt",
+    ".go",
+    ".php",
+    ".rb",
+    ".cs",
+    ".yml",
+    ".yaml",
+    ".json",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".properties",
+    ".env",
+    ".xml",
+    ".md",
+    ".txt",
+    ".sh",
+    ".ps1",
+}
+MAX_DEPTH = 16
+MAX_FILES = 8000
 MAX_BYTES = 512_000
 DEFAULT_ENGINE_BY_PORT = {3306: "mysql", 5432: "postgres", 1433: "sqlserver", 1521: "oracle"}
 
@@ -119,6 +149,9 @@ YAML_LINE_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_.-]*)\s*:\s*(.*)$")
 PROP_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*(.*)$")
 
 
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "local", "host.docker.internal"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Find workspace database settings")
     parser.add_argument("--workspace", default=".", help="Workspace directory to scan")
@@ -127,24 +160,48 @@ def main() -> int:
     if not workspace.is_dir():
         print(f"工作区不存在：{workspace}", file=sys.stderr)
         return 2
-    configs = find_configs(workspace)
-    json.dump({"configs": configs}, sys.stdout, ensure_ascii=False, indent=2)
+    payload = find_configs(workspace)
+    json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
     return 0
 
 
-def find_configs(workspace: Path) -> list[dict[str, object]]:
+def find_configs(workspace: Path) -> dict[str, object]:
     found: list[dict[str, object]] = []
+    deploys: list[dict[str, object]] = []
     scanned = 0
     for path in iter_candidate_files(workspace):
         scanned += 1
         if scanned > MAX_FILES:
             break
-        found.extend(configs_in_file(workspace, path))
+        text, values = read_file(workspace, path)
+        if text is None or values is None:
+            continue
+        found.extend(configs_from_text(workspace, path, text, values))
+        target = deploy_target(workspace, path, values)
+        if target is not None:
+            deploys.append(target)
     real = [item for item in found if not item.pop("_example")]
     chosen = real if real else found
-    chosen.sort(key=lambda item: (int(item.pop("_rank")), str(item["source"])))
-    return chosen
+    servers: list[dict[str, object]] = []
+    locals_: list[dict[str, object]] = []
+    skipped_local = 0
+    for item in chosen:
+        kind = connection_kind(item)
+        if kind == "server":
+            servers.append(item)
+        else:
+            if kind == "local":
+                skipped_local += 1
+                locals_.append(item)
+            else:
+                item.pop("_rank", None)
+    if not servers:
+        servers.extend(remote_sqlite_configs(workspace, locals_, deploys))
+    servers.sort(key=lambda item: (int(item.pop("_rank")), str(item["source"])))
+    for item in locals_:
+        item.pop("_rank", None)
+    return {"configs": servers, "skipped_local": skipped_local}
 
 
 def iter_candidate_files(workspace: Path):
@@ -163,60 +220,208 @@ def iter_candidate_files(workspace: Path):
 
 def is_candidate(path: Path) -> bool:
     name = path.name.lower()
-    if name.startswith(".env") or name in {".env.local", ".env.development", ".env.production"}:
+    if name.startswith(".env"):
         return True
-    stems = {
-        "application.yml",
-        "application.yaml",
-        "application.properties",
-        "database.yml",
-        "database.yaml",
-        "database.json",
-        "database.properties",
-        "db.json",
-        "datasource.yml",
-        "datasource.yaml",
-        "datasource.properties",
-    }
-    if name in stems or name.startswith("application-") and path.suffix.lower() in {".yml", ".yaml", ".properties"}:
-        return True
-    return any(token in name for token in ("database", "datasource", "jdbc")) and path.suffix.lower() in {
-        ".yml",
-        ".yaml",
-        ".json",
-        ".properties",
-        ".env",
-        ".ini",
-        ".toml",
-        ".xml",
-        ".conf",
-    }
+    return path.suffix.lower() in TEXT_SUFFIXES
 
 
-def configs_in_file(workspace: Path, path: Path) -> list[dict[str, object]]:
+def read_file(workspace: Path, path: Path) -> tuple[str | None, dict[str, str] | None]:
     try:
         resolved = path.resolve()
         resolved.relative_to(workspace)
         if resolved.stat().st_size > MAX_BYTES:
-            return []
+            return None, None
         text = resolved.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError, ValueError):
-        return []
-    values = parse_values(path, text)
+        return None, None
+    return text, parse_values(path, text)
+
+
+def configs_from_text(
+    workspace: Path,
+    path: Path,
+    text: str,
+    values: dict[str, str],
+) -> list[dict[str, object]]:
     configs: list[dict[str, object]] = []
-    url = first_value(values, URL_KEYS)
-    if url:
-        configs.append(config_from_url(workspace, path, url, values))
-    elif JDBC_RE.search(text) or GENERIC_URL_RE.search(text):
-        matched = JDBC_RE.search(text) or GENERIC_URL_RE.search(text)
-        if matched:
-            raw_url = matched.group(0) if matched.re is GENERIC_URL_RE else f"jdbc:{matched.group(1)}:{matched.group(2)}"
+    urls = collect_urls(text, values)
+    if urls:
+        for raw_url in urls:
             configs.append(config_from_url(workspace, path, raw_url, values))
     else:
         built = config_from_fields(workspace, path, values)
         if built is not None:
             configs.append(built)
     return [item for item in configs if item.get("engine") or item.get("host") or item.get("database")]
+
+
+def deploy_target(workspace: Path, path: Path, values: dict[str, str]) -> dict[str, object] | None:
+    host = values.get("ssh_host") or values.get("deploy_host")
+    app_path = values.get("ssh_app_path") or values.get("app_path") or values.get("remote_path") or ""
+    entry = values.get("entry_url") or values.get("health_url") or ""
+    if not host and entry.startswith("http"):
+        host = urlparse(entry).hostname
+    if not isinstance(host, str) or not safe_server_host(host) or not safe_ssh_user(values.get("ssh_user")):
+        return None
+    relative = path.relative_to(workspace).as_posix()
+    lowered = relative.lower()
+    if not app_path and "deploy" not in lowered and "workbuddy" not in lowered:
+        return None
+    return {
+        "source": relative,
+        "host": host,
+        "port": parse_port(values.get("ssh_port")) or 22,
+        "user": values.get("ssh_user"),
+        "app_path": app_path.rstrip("/"),
+        "rank": len(path.relative_to(workspace).parts),
+    }
+
+
+def remote_sqlite_configs(
+    workspace: Path,
+    locals_: list[dict[str, object]],
+    deploys: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    if not deploys:
+        return []
+    deploy = min(deploys, key=lambda item: (int(item["rank"]), str(item["source"])))
+    chosen: dict[str, dict[str, object]] = {}
+    for item in sorted(locals_, key=source_rank):
+        if str(item.get("engine") or "") != "sqlite":
+            continue
+        relative = locate_sqlite(workspace, item)
+        if relative is None or relative in chosen:
+            continue
+        if "/tests/" in f"/{relative}/" or relative.startswith("tests/"):
+            continue
+        app_path = str(deploy["app_path"])
+        remote_path = f"{app_path}/{relative}" if app_path else relative
+        if not safe_remote_path(remote_path):
+            continue
+        chosen[relative] = {
+            "source": f"{deploy['source']} + {item['source']}",
+            "engine": "sqlite",
+            "host": deploy["host"],
+            "port": deploy["port"],
+            "database": remote_path,
+            "username": deploy["user"],
+            "password": None,
+            "url": None,
+            "via": "ssh",
+            "_rank": int(deploy["rank"]) - 30,
+        }
+    return list(chosen.values())
+
+
+def locate_sqlite(workspace: Path, item: dict[str, object]) -> str | None:
+    raw = str(item.get("database") or "").replace("\\", "/")
+    name = Path(raw).name
+    if not name or name.startswith(":memory"):
+        return None
+    matches: list[str] = []
+    for directory, dir_names, file_names in os.walk(workspace):
+        current = Path(directory)
+        depth = len(current.relative_to(workspace).parts)
+        dir_names[:] = [dir_name for dir_name in dir_names if dir_name not in SKIP_DIRS]
+        if depth > MAX_DEPTH:
+            dir_names[:] = []
+            continue
+        if name in file_names:
+            relative = (current / name).relative_to(workspace).as_posix()
+            if "/tests/" in f"/{relative}/" or relative.startswith("tests/"):
+                continue
+            matches.append(relative)
+    if not matches:
+        return None
+    source = str(item.get("source") or "")
+    matches.sort(key=lambda relative: (0 if source.startswith(str(Path(relative).parent)) else 1, len(relative)))
+    return matches[0]
+
+
+def source_rank(item: dict[str, object]) -> tuple[int, str]:
+    source = str(item.get("source") or "").lower()
+    rank = int(item.get("_rank") or 0)
+    if source.endswith(".md") or source.startswith("docs/") or "/docs/" in source:
+        rank += 50
+    if "/tests/" in source or source.startswith("tests/"):
+        rank += 40
+    if source.endswith(("config.py", "config.yml", "config.yaml", ".env")):
+        rank -= 15
+    return rank, source
+
+
+def is_local_host(host: str) -> bool:
+    lowered = host.strip().lower()
+    return not lowered or lowered in LOCAL_HOSTS or lowered.endswith(".local")
+
+
+_HOST_RE = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+)
+_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9._-]{0,31}$")
+
+
+def safe_server_host(host: str) -> bool:
+    host = host.strip()
+    if not host or len(host) > 253 or is_local_host(host):
+        return False
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", host):
+        return all(0 <= int(part) <= 255 for part in host.split("."))
+    return _HOST_RE.fullmatch(host) is not None
+
+
+def safe_ssh_user(user: object) -> bool:
+    if user is None:
+        return True
+    return isinstance(user, str) and _USER_RE.fullmatch(user) is not None
+
+
+def safe_remote_path(path: str) -> bool:
+    if not path or path.startswith("-") or ".." in path.split("/"):
+        return False
+    return re.fullmatch(r"[A-Za-z0-9._/-]+", path) is not None
+
+
+def collect_urls(text: str, values: dict[str, str]) -> list[str]:
+    found: list[str] = []
+    for key, value in values.items():
+        if key in URL_KEYS or key.endswith("_url") or key.endswith("_jdbc_url"):
+            if looks_like_db_url(value):
+                found.append(value)
+    for matched in JDBC_RE.finditer(text):
+        found.append(f"jdbc:{matched.group(1)}:{matched.group(2)}")
+    for matched in GENERIC_URL_RE.finditer(text):
+        found.append(matched.group(1))
+    unique: list[str] = []
+    seen: set[str] = set()
+    for raw_url in found:
+        cleaned = raw_url.strip().strip("'\"")
+        key = cleaned[5:] if cleaned.lower().startswith("jdbc:") else cleaned
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        unique.append(cleaned)
+    return unique
+
+
+def looks_like_db_url(value: str) -> bool:
+    lowered = value.lower()
+    return lowered.startswith("jdbc:") or GENERIC_URL_RE.search(value) is not None
+
+
+def connection_kind(item: dict[str, object]) -> str:
+    host = str(item.get("host") or "").strip()
+    database = str(item.get("database") or "").strip()
+    engine = str(item.get("engine") or "").lower()
+    if "${" in host or "${" in database:
+        return "skip"
+    if engine == "sqlite" and is_local_host(host):
+        return "local"
+    if is_local_host(host):
+        return "local"
+    if not safe_server_host(host):
+        return "skip"
+    return "server"
 
 
 def parse_values(path: Path, text: str) -> dict[str, str]:
@@ -481,9 +686,10 @@ def normalize_key(key: str) -> str:
 
 
 def strip_quotes(value: str) -> str:
+    value = value.split(" #", 1)[0].strip().rstrip(",")
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
-    return value.split(" #", 1)[0].strip()
+    return value
 
 
 def parse_port(value: str | None) -> int | None:

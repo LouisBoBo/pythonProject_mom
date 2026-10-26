@@ -10,9 +10,10 @@ alwaysApply: true
 ## 必须
 
 - Windows 桌面安装包用这一条命令打包：`powershell -File desktop\package-windows.ps1`。它会把安装包复制到 `dist/`。
+- macOS 桌面安装包用这一条命令打包：`bash desktop/package-macos.sh`。它会把未签名 DMG 复制到 `dist/`。
 - 打包完成后，把安装包/压缩包**复制或移动**到 `dist/`（可保留构建缓存于源码仓或 `.desktop-build`，但用户可见交付物以 `dist/` 为准）。
 - 向用户汇报打包结果时，优先给出 `dist/` 下的路径。
-- 文件名保持可识别版本信息（如 `zr-dsh-*-win-x64-unsigned.exe`）。
+- 文件名保持可识别版本信息（如 `zr-dsh-*-win-x64-unsigned.exe`、`zr-dsh-*-mac-x64-unsigned.dmg`）。
 
 ## 禁止
 

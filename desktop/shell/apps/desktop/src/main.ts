@@ -44,10 +44,12 @@ import {
   readDesktopLocalePreference,
   readDesktopShellSnapshot,
   serveCachedShellScript,
+  shellScriptKeys,
   writeDesktopLocalePreference,
   writeDesktopShellSnapshot,
   type DesktopShellSnapshot,
 } from './shell-cache.ts'
+import { bootScriptsChanged, watchProfilePlugins } from './plugin-visibility.ts'
 import { DesktopFatalRecovery } from './fatal-recovery.ts'
 import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
 import { mountWelcomeView, type WelcomeSurface } from './welcome-window.ts'
@@ -73,6 +75,9 @@ import { DesktopUpdateOverlays } from './update-overlay.ts'
 import { DesktopQuitConfirmation } from './quit-confirmation.ts'
 import { DesktopTray } from './tray.ts'
 import { DesktopBackgroundNotice } from './background-notice.ts'
+import {
+  companyMarketScript, ensureCompanyMarketProfile, startCompanyMarketBridge, stopCompanyMarketBridge,
+} from './company-market.ts'
 
 let focusPrimaryWindow = (): void => {}
 let stopForRecovery = async (): Promise<void> => {}
@@ -427,9 +432,13 @@ async function main(): Promise<void> {
   let hostCookie: string | undefined
   const browserGuests = new DesktopBrowserGuests(() => hostUrl)
   let injections: readonly unknown[] = []
+  let bootedScriptKeys: readonly string[] | undefined
   let shellSnapshot: DesktopShellSnapshot | undefined
   let shellSnapshotLoaded = false
   let servedCachedShell = false
+  let pluginApply = false
+  let pluginWatch: { close(): void } | undefined
+  let applyInstalledPlugins: () => Promise<boolean> = async () => false
   const currentShellSnapshot = (): DesktopShellSnapshot | undefined => {
     if (!shellSnapshotLoaded) {
       shellSnapshotLoaded = true
@@ -491,12 +500,27 @@ async function main(): Promise<void> {
     navigation = next
     return next.promise
   }
+  // The page often paints from the previous shell snapshot before the Host is ready.
+  // When the live script list differs, keep that page. Reloading here paints the
+  // startup screen again after data sync has already succeeded.
+  const refreshRunningShell = (): void => {
+    if (pluginApply || quitting || shuttingDown) return
+    if (!bootScriptsChanged(bootedScriptKeys, injections)) return
+    bootedScriptKeys = shellScriptKeys(injections)
+  }
   const platformView = new DesktopPlatformView(join(app.getAppPath(), 'lib', 'preload-platform-account.cjs'),
     () => locale.id === 'zh-CN' ? 'zh_CN' : 'en_US', process.platform === 'win32' ? 'win32' : 'darwin')
   const backend = new DesktopBackendController((onFailure) => {
     const hostInspectPort = developmentHostInspectPort(development)
     const host = new DesktopHostProcess(resources.node, resources.dsh, activeProject,
-      hostInspectPort, { ...hostEnvironment, DSH_HOME: zrDesktopHome(), DSH_CLIENT_VERSION: desktopClientVersion() }, onFailure,
+      hostInspectPort, {
+        ...hostEnvironment,
+        DSH_HOME: zrDesktopHome(),
+        DSH_CLIENT_VERSION: desktopClientVersion(),
+        DSH_BUNDLED_SKILL_DIR: app.isPackaged
+          ? join(process.resourcesPath, 'skills')
+          : join(app.getAppPath(), 'resources', 'skills'),
+      }, onFailure,
       primaryRuntime,
       resources, (next) => { platformView.setSession(next) })
     return {
@@ -507,10 +531,14 @@ async function main(): Promise<void> {
         publishHostOrigin(new URL(ready.url).origin)
         if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
         injections = ready.injections
+        refreshRunningShell()
+        if (pluginWatch === undefined) pluginWatch = watchProfilePlugins(paths.profile, () => applyInstalledPlugins())
         void captureDesktopShellSnapshot(app.getVersion(), ready.url, hostCookie, injections, (input, init) => net.fetch(input, init))
           .then((snapshot) => {
             if (snapshot === undefined) return
             writeDesktopShellSnapshot(zrDesktopHome(), snapshot)
+            shellSnapshot = snapshot
+            shellSnapshotLoaded = true
           })
           .catch((error: unknown) => { console.error(error) })
         welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
@@ -565,6 +593,47 @@ async function main(): Promise<void> {
     if (state.phase === 'error') reportFatal(state.failure, 'host')
     else if (!shuttingDown) backendReady = state.phase === 'ready'
   })
+  // Without HMR the Host saves a plugin and leaves the previous client running.
+  // Restarting that Host and loading the window again is what makes the new sidebar appear.
+  applyInstalledPlugins = async (): Promise<boolean> => {
+    if (quitting || shuttingDown || pluginApply || backend.host === undefined) return false
+    pluginApply = true
+    let hostReady: Promise<void> | undefined
+    try {
+      hostUrl = undefined
+      hostCookie = undefined
+      await backend.stop()
+      if (quitting) return true
+      hostReady = backend.start(prepareHostEnvironment)
+      startup = hostReady
+      await hostReady
+      if (quitting || backend.host === undefined) return true
+      bootedScriptKeys = undefined
+      navigation = undefined
+      await navigateMain(applicationUrl)
+      return true
+    } catch (error) {
+      console.error('desktop plugin apply failed', error)
+      if (!quitting && backend.host === undefined) {
+        try {
+          hostReady = backend.start(prepareHostEnvironment)
+          startup = hostReady
+          await hostReady
+          if (backend.host !== undefined) {
+            navigation = undefined
+            await navigateMain(applicationUrl)
+            return true
+          }
+        } catch (retryError) {
+          reportFatal(retryError, 'host')
+        }
+      }
+      return false
+    } finally {
+      pluginApply = false
+      if (hostReady !== undefined && startup === hostReady) startup = undefined
+    }
+  }
   // The Host starts after the startup screen is visible. See reconcileBackend.
 
   const updateErrors = new WeakMap<DesktopUpdateState, Promise<void>>()
@@ -626,6 +695,10 @@ async function main(): Promise<void> {
       await startupPainted
       const hostReady = backend.start(async () => {
         await Promise.all([manager.applyRelease(), prepareHostEnvironment()])
+        if (companyMarketScript(app.isPackaged, process.resourcesPath) !== undefined) {
+          ensureCompanyMarketProfile(paths.profile)
+        }
+        startCompanyMarketBridge(app.isPackaged, process.resourcesPath, process.execPath)
       })
       await hostReady
       if (backend.host !== undefined) {
@@ -753,11 +826,13 @@ async function main(): Promise<void> {
       const cached = currentShellSnapshot()
       if (cached !== undefined) {
         servedCachedShell = true
+        bootedScriptKeys = shellScriptKeys(cached.injections)
         return { injections: cached.injections, streamBaseUrl: DESKTOP_SHELL_PENDING_ORIGIN }
       }
     }
     await startup
     if (backend.host === undefined || hostUrl === undefined) throw new Error('Desktop Host is unavailable')
+    bootedScriptKeys = shellScriptKeys(injections)
     return { injections, streamBaseUrl: new URL(hostUrl).origin }
   })
 
@@ -996,6 +1071,7 @@ async function main(): Promise<void> {
   }
   powerMonitor.on('resume', automaticCheck)
   app.on('will-quit', () => {
+    pluginWatch?.close()
     updateSchedule.dispose()
     powerMonitor.off('resume', automaticCheck)
     updates.dispose()
@@ -1388,6 +1464,7 @@ async function main(): Promise<void> {
   const finishQuit = (): void => {
     quitting = true
     shuttingDown = true
+    stopCompanyMarketBridge()
     updateJournal?.action('quit-requested')
     quitConfirmation.dispose()
     backgroundNotice?.dispose()

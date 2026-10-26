@@ -1,6 +1,6 @@
 import { officePackageDirectories } from '../../../scripts/libreoffice-packages.mjs'
 import { X509Certificate } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -33,6 +33,16 @@ import {
   verifyMacOSAppUpdateConfig,
   writeMacOSAppUpdateConfig,
 } from './macos-app-update-config.mjs'
+
+/** Company market bridge shipped beside the app, when this checkout is linked to the product repo. */
+function companyMarketBridge() {
+  const marker = fileURLToPath(new URL('../../../.dsh-mom-root', import.meta.url))
+  if (!existsSync(marker)) return []
+  const productRoot = readFileSync(marker, 'utf8').replace(/^\uFEFF/u, '').trim()
+  const script = join(productRoot, 'scripts', 'company-market-bridge.mjs')
+  if (!existsSync(script)) return []
+  return [{ from: script, to: 'company-market-bridge.mjs' }]
+}
 
 /**
  * Create electron-builder configuration from one release environment.
@@ -152,9 +162,11 @@ export function createElectronBuilderConfig(
     asarUnpack: unpack,
     extraResources: [
       { from: buildPaths.runtime, to: 'runtime' },
+      { from: fileURLToPath(new URL('../resources/skills', import.meta.url)), to: 'skills' },
       { from: fileURLToPath(new URL('../resources/icon-windows.png', import.meta.url)), to: 'icon.png' },
       // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
       ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
+      ...companyMarketBridge(),
     ],
     mac: {
       icon: fileURLToPath(new URL('../resources/icon-macos.png', import.meta.url)),

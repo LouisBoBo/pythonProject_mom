@@ -15,10 +15,18 @@ powershell -File desktop\package-windows.ps1
 
 `C:\dsh-src` 里的 `package:win:x64:unsigned` 在打包前也会再套一次 `desktop/shell`。没有本仓库链接时，这条官方命令会停下来，不会打出官方原版登录界面。不要单独跑 `electron-builder` 或 `pnpm run package:win:x64:unsigned` 来绕过 `desktop\package-windows.ps1`。
 
+macOS 未签名安装包只从本仓库执行：
+
+```bash
+bash desktop/package-macos.sh
+```
+
+这条命令把官方壳克隆到 `~/dsh-src`（可用 `DSH_BUILD_ROOT` 改路径），套上 `desktop/shell`，按本机架构执行官方 `package:desktop:mac:x64:unsigned` 或 `package:desktop:mac:arm64:unsigned`，并把 `zr-dsh-*-mac-*-unsigned.dmg` 复制到本仓库 `dist/`。未签名 DMG 不做 Apple 公证。不要单独跑 `electron-builder` 或 `pnpm run package:mac:*:unsigned` 来绕过 `desktop/package-macos.sh`。
+
 改壳之前先运行 `desktop/shell-sync.ps1 -Mode apply`。改完并验证后运行 `-Mode capture`，把同一批文件收回本仓库。不要只把改动留在 `C:\dsh-src`。
 
 ## 禁止
 
-- 未运行 `desktop\package-windows.ps1` 就启动桌面打包。
+- 未运行对应平台的打包命令就启动桌面打包：Windows 用 `desktop\package-windows.ps1`，macOS 用 `desktop/package-macos.sh`。
 - 安装包已经打好、源码没变，只为了交到 `dist/` 而重新打包。
 - 未说明这次走的是本仓库这条打包命令就开始打包。

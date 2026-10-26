@@ -13,6 +13,8 @@ apps/desktop/renderer/welcome.css
 apps/desktop/resources/icon-macos.png
 apps/desktop/resources/icon-windows.png
 apps/desktop/resources/icon.png
+apps/desktop/resources/skills/workspace-lianku/SKILL.md
+apps/desktop/resources/skills/workspace-lianku/scripts/find_db_config.py
 apps/desktop/resources/tray-windows.ico
 apps/desktop/package.json
 apps/desktop/scripts/apply-product-overlay.mjs
@@ -57,11 +59,14 @@ apps/desktop/resources/icon-windows.ico
 apps/desktop/resources/icon.ico
 apps/desktop/scripts/render-app-icons.mjs
 apps/desktop/scripts/render-installer-brand.mjs
+apps/desktop/src/company-market.ts
 apps/desktop/src/local-login.ts
 apps/desktop/src/login-enterprises.ts
 apps/desktop/src/shell-cache.ts
+apps/desktop/src/plugin-visibility.ts
 apps/desktop/tests/local-login.spec.ts
 apps/desktop/tests/shell-cache.spec.ts
+apps/desktop/tests/plugin-visibility.spec.ts
 apps/desktop/src/ipc.ts
 apps/desktop/src/web-document.ts
 apps/desktop/tests/web-document.spec.ts
