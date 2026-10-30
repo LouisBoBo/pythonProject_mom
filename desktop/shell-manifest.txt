@@ -21,6 +21,7 @@ apps/desktop/scripts/apply-product-overlay.mjs
 apps/desktop/scripts/electron-builder-config.mjs
 apps/desktop/scripts/installer-directories.nsh
 apps/desktop/scripts/installer.nsh
+apps/desktop/scripts/prepare-dsh.ts
 apps/desktop/scripts/smoke-packaged-runtime.ts
 apps/desktop/src/client/WelcomePage.tsx
 apps/desktop/src/host-process.ts

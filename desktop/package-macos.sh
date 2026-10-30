@@ -97,6 +97,58 @@ if [[ ! -f "$BuildRoot/node_modules/.modules.yaml" ]]; then
   )
 fi
 
+# --- 额外依赖：对话写码插件 + Cursor SDK ---
+# pnpm install --frozen-lockfile 只装上游仓库原始依赖树；
+# 下面两个包需要从公司 registry 拉，且不在上游 lockfile 里。
+# 这里在 frozen-lockfile 之后追加安装，保持 BuildRoot 原始 lockfile 不变。
+# 注意: Cursor SDK native binding 命名用 x64/arm64，和 uname -m 的 x86_64/arm64 不同。
+DshPluginRegistry="${DSH_PLUGIN_REGISTRY:-http://175.178.238.31/dsh-plugins/npm/}"
+DshNpmRegistry="${DSH_DESKTOP_NPM_REGISTRY:-https://registry.npmmirror.com}"
+CursorSdkVer="1.0.31"
+CursorPluginVer="0.1.8"
+case "$(uname -m)" in
+  x86_64) CursorArch="x64" ;;
+  arm64)  CursorArch="arm64" ;;
+  *)      CursorArch="$(uname -m)" ;;
+esac
+CursorNative="@cursor/sdk-darwin-$CursorArch"
+
+needs_extra_install=0
+if [[ ! -d "$BuildRoot/node_modules/@zhongruan/dsh-cursor-chat" ]]; then
+  needs_extra_install=1
+fi
+if [[ ! -d "$BuildRoot/node_modules/@cursor/sdk" ]]; then
+  needs_extra_install=1
+fi
+if [[ ! -d "$BuildRoot/node_modules/$CursorNative" ]]; then
+  needs_extra_install=1
+fi
+
+if [[ "$needs_extra_install" -eq 1 ]]; then
+  echo "installing extra dependencies: dsh-cursor-chat + cursor-sdk (native: $CursorNative)"
+  # scope-based .npmrc: @zhongruan 从公司 registry，其余从镜像
+  cat > "$BuildRoot/.npmrc" <<EOF
+@zhongruan:registry=$DshPluginRegistry
+@cursor:registry=$DshNpmRegistry
+registry=$DshNpmRegistry
+fetch-timeout=120000
+fetch-retries=3
+network-concurrency=4
+EOF
+  (
+    cd "$BuildRoot"
+    corepack pnpm add -Dw \
+      "@zhongruan/dsh-cursor-chat@$CursorPluginVer" \
+      "@cursor/sdk@$CursorSdkVer" \
+      "$CursorNative@$CursorSdkVer" \
+      --fetch-timeout 120000 --fetch-retries 3 --network-concurrency 4
+  )
+  if [[ $? -ne 0 ]]; then
+    echo "failed to install cursor-chat plugin dependencies" >&2
+    exit 1
+  fi
+fi
+
 case "$(uname -m)" in
   x86_64) script_target="mac:x64"; artifact_target="mac-x64" ;;
   arm64) script_target="mac:arm64"; artifact_target="mac-arm64" ;;
@@ -107,6 +159,11 @@ case "$(uname -m)" in
 esac
 
 python3 "$DesktopRoot/prefetch-macos-runtime.py" "$BuildRoot" "$artifact_target"
+
+# Tell mom's prepare-dsh.ts overlay where the real BuildRoot is, so it can
+# additionally copy @cursor/* + @zhongruan/* from BuildRoot root node_modules
+# into the dsh runtime (those packages are NOT in the pre-packaged package-set tarballs).
+export MOM_BUILD_ROOT="$BuildRoot"
 
 (
   cd "$BuildRoot"
