@@ -74,3 +74,12 @@ apps/desktop/tests/web-document.spec.ts
 apps/desktop/src/preload-app.ts
 packages/client/ui-settings-account/src/client/AccountMenu.tsx
 packages/client/ui-settings-account/src/client/AccountMenu.module.css
+apps/desktop/src/gateway-trust.ts
+apps/desktop/src/model-gateway.ts
+apps/desktop/src/welcome-backend.ts
+apps/desktop/tests/fixtures/gateway-ca/ca.pem
+apps/desktop/tests/fixtures/gateway-ca/server.key
+apps/desktop/tests/fixtures/gateway-ca/server.pem
+apps/desktop/tests/gateway-trust.spec.ts
+apps/desktop/tests/model-gateway.spec.ts
+apps/desktop/tests/welcome-backend.spec.ts

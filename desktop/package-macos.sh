@@ -58,6 +58,8 @@ if [[ "$node_ok" -ne 1 ]]; then
 fi
 echo "node $(node -v)"
 
+node "$RepoRoot/scripts/check-skill-sync.mjs"
+
 if [[ ! -d "$BuildRoot/.git" ]]; then
   if [[ -e "$BuildRoot" ]]; then
     echo "$BuildRoot exists but is not a git checkout. Move that folder aside, then run this script again." >&2
@@ -102,10 +104,18 @@ fi
 # 下面两个包需要从公司 registry 拉，且不在上游 lockfile 里。
 # 这里在 frozen-lockfile 之后追加安装，保持 BuildRoot 原始 lockfile 不变。
 # 注意: Cursor SDK native binding 命名用 x64/arm64，和 uname -m 的 x86_64/arm64 不同。
+# NOTE: @zhongruan/dsh-cursor-chat 用本地 tgz（未发布到公司 registry 时的 fallback）
+LocalPluginTgz="/tmp/zhongruan-dsh-cursor-chat-0.2.0.tgz"
 DshPluginRegistry="${DSH_PLUGIN_REGISTRY:-http://175.178.238.31/dsh-plugins/npm/}"
 DshNpmRegistry="${DSH_DESKTOP_NPM_REGISTRY:-https://registry.npmmirror.com}"
 CursorSdkVer="1.0.31"
-CursorPluginVer="0.1.8"
+CursorPluginVer="0.2.0"
+# 优先用本地 tgz（包含最新删除流水线代码），没有则从 registry 拉
+if [[ -f "$LocalPluginTgz" ]]; then
+  PluginInstallSpec="$LocalPluginTgz"
+else
+  PluginInstallSpec="@zhongruan/dsh-cursor-chat@$CursorPluginVer"
+fi
 case "$(uname -m)" in
   x86_64) CursorArch="x64" ;;
   arm64)  CursorArch="arm64" ;;
@@ -114,8 +124,14 @@ esac
 CursorNative="@cursor/sdk-darwin-$CursorArch"
 
 needs_extra_install=0
-if [[ ! -d "$BuildRoot/node_modules/@zhongruan/dsh-cursor-chat" ]]; then
+# 检查插件目录存在 AND 包含我们期望的新文件（避免旧版 0.1.8 残留被跳过）
+if [[ ! -d "$BuildRoot/node_modules/@zhongruan/dsh-cursor-chat/lib" ]]; then
   needs_extra_install=1
+elif [[ ! -f "$BuildRoot/node_modules/@zhongruan/dsh-cursor-chat/lib/deleteEnforce.js" ]]; then
+  echo "旧版 dsh-cursor-chat 残留（缺少 deleteEnforce.js），强制重装"
+  needs_extra_install=1
+  # 清掉让 pnpm add 重装
+  rm -rf "$BuildRoot/node_modules/@zhongruan/dsh-cursor-chat" 2>/dev/null
 fi
 if [[ ! -d "$BuildRoot/node_modules/@cursor/sdk" ]]; then
   needs_extra_install=1
@@ -138,7 +154,7 @@ EOF
   (
     cd "$BuildRoot"
     corepack pnpm add -Dw \
-      "@zhongruan/dsh-cursor-chat@$CursorPluginVer" \
+      "$PluginInstallSpec" \
       "@cursor/sdk@$CursorSdkVer" \
       "$CursorNative@$CursorSdkVer" \
       --fetch-timeout 120000 --fetch-retries 3 --network-concurrency 4

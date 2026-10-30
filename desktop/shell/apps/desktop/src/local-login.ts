@@ -5,7 +5,7 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node
 import { join } from 'node:path'
 import { DEFAULT_ENTERPRISE_KEY, normalizeEnterpriseKey } from './login-enterprises.ts'
 
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 const SESSION_SKEW_MS = 30 * 1000
 const SCRYPT_N = 16384
 const SCRYPT_R = 8
@@ -189,6 +189,22 @@ export function submitLocalLogin(directory: string, input: LoginInput, now = Dat
     expiresAt: now + SESSION_TTL_MS,
   })
   return { ok: true }
+}
+
+/**
+ * Remember a session the company gateway issued, so later launches admit the workspace
+ * without asking for the password again. The account store is not touched: credentials
+ * live on the gateway, and this file only holds the local admission ticket.
+ * @param directory - local login directory.
+ * @param session - username, display name, enterprise, and the gateway's expiry.
+ */
+export function recordGatewaySession(directory: string, session: LoginSession): void {
+  writeSession(directory, {
+    username: session.username,
+    displayName: session.displayName,
+    enterpriseKey: normalizeEnterpriseKey(session.enterpriseKey),
+    expiresAt: session.expiresAt,
+  })
 }
 
 /** Drop the remembered session. The account store stays. */

@@ -36,7 +36,7 @@ import { claimDesktopSingleInstance } from './single-instance.ts'
 import { desktopUpdateChannel } from './update-channel.ts'
 import { DesktopUpdateCoordinator } from './update-coordinator.ts'
 import { DesktopCommandManager } from './command-management.ts'
-import { serveWebDocument, authenticateWebHost, forwardWebRequest } from './web-document.ts'
+import { serveWebDocument, authenticateWebHost, forwardWebRequest, isStaleHostAuthCookie } from './web-document.ts'
 import {
   DESKTOP_SHELL_PENDING_ORIGIN,
   captureDesktopShellSnapshot,
@@ -54,7 +54,9 @@ import { DesktopFatalRecovery } from './fatal-recovery.ts'
 import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
 import { mountWelcomeView, type WelcomeSurface } from './welcome-window.ts'
 import { WELCOME_IPC, needsWelcome, type WelcomeLoginInput, type WelcomeNotice } from './welcome-api.ts'
-import { clearLocalSession, localLoginDirectory, loginInitialized, readValidSession, submitLocalLogin } from './local-login.ts'
+import { clearLocalSession, localLoginDirectory, loginInitialized, readValidSession, recordGatewaySession, submitLocalLogin } from './local-login.ts'
+import { resolveGatewayConfig, ensureGatewayProfile, loginWithGateway, GATEWAY_CREDENTIAL_REF } from './model-gateway.ts'
+import { trustGatewayCa, writeGatewayCaFile } from './gateway-trust.ts'
 import { connectDesktopWelcome, type DesktopWelcomeBackend } from './welcome-backend.ts'
 import { DesktopUpdateJournal } from './update-journal.ts'
 import { DesktopUpdatePreparationError } from './update-error.ts'
@@ -340,6 +342,18 @@ function localSessionActive(): boolean {
   return readValidSession(desktopLoginDirectory()) !== null
 }
 
+/**
+ * Forget Host authentication cookies from earlier launches before this Host issues its own.
+ * Nothing else reads them: the shell forwards the cookie it received from the current Host.
+ */
+async function discardStaleHostAuthCookies(): Promise<void> {
+  const cookies = await session.defaultSession.cookies.get({})
+  for (const cookie of cookies) {
+    if (!isStaleHostAuthCookie(cookie)) continue
+    await session.defaultSession.cookies.remove(`http://${cookie.domain}${cookie.path}`, cookie.name)
+  }
+}
+
 async function main(): Promise<void> {
   const desktopSettings = readDesktopSettings(app.getPath('userData'))
   void pruneCrashReports(app.getPath('logs'))
@@ -352,6 +366,8 @@ async function main(): Promise<void> {
     ? developmentPrimaryRuntime()
     : join(process.resourcesPath, 'runtime', 'primary-runtime')
   const activeProject = paths.profile
+  const gateway = resolveGatewayConfig()
+  if (gateway !== undefined) trustGatewayCa()
   const manager = new DesktopProjectManager(paths, resources)
   // Dock and Finder launches inherit only launchd's environment; every Host shares one login-shell read.
   const loginShellRead = new AbortController()
@@ -364,7 +380,13 @@ async function main(): Promise<void> {
     return result.environment
   })
   let hostEnvironment: NodeJS.ProcessEnv = process.env
-  const prepareHostEnvironment = async (): Promise<void> => { hostEnvironment = await loginShell }
+  const prepareHostEnvironment = async (): Promise<void> => {
+    hostEnvironment = await loginShell
+    if (gateway === undefined) return
+    ensureGatewayProfile(paths.profile, gateway)
+    const bundle = writeGatewayCaFile(join(app.getPath('userData'), 'gateway'), hostEnvironment.NODE_EXTRA_CA_CERTS)
+    if (bundle !== undefined) hostEnvironment = { ...hostEnvironment, NODE_EXTRA_CA_CERTS: bundle }
+  }
   let quitting = false
   let startup: Promise<void> | undefined
   let workspaceRecovery: Promise<void> | undefined
@@ -526,6 +548,7 @@ async function main(): Promise<void> {
     return {
       start: async () => {
         const ready = await host.start()
+        await discardStaleHostAuthCookies()
         hostCookie = await authenticateWebHost(ready.url)
         hostUrl = ready.url
         publishHostOrigin(new URL(ready.url).origin)
@@ -541,7 +564,7 @@ async function main(): Promise<void> {
             shellSnapshotLoaded = true
           })
           .catch((error: unknown) => { console.error(error) })
-        welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '))
+        welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '), gateway === undefined ? {} : { credentialRef: GATEWAY_CREDENTIAL_REF })
         analyticsEnabled = await welcomeBackend.analyticsEnabled().catch(() => false)
         if (!reportedLaunch) { reportedLaunch = true; void track('desktop_app_launch', {}) }
         stopAccount?.()
@@ -685,6 +708,16 @@ async function main(): Promise<void> {
   const readWelcomeState = async () => {
     if (backend.host === undefined || welcomeBackend === undefined) throw new Error('desktop welcome: backend unavailable')
     return welcomeBackend.read()
+  }
+  /**
+   * The gateway route reads its token per request, so a remembered session
+   * without one would open a workspace whose model calls all fail. Asking for
+   * the password again is the only recovery: the token cannot be re-minted
+   * from the local file. A backend that cannot answer keeps the old behaviour.
+   */
+  const gatewayCredentialStored = async (): Promise<boolean> => {
+    if (gateway === undefined || welcomeBackend === undefined) return true
+    return welcomeBackend.read().then(state => state.hasApiKey).catch(() => true)
   }
   stopForRecovery = () => backend.close()
 
@@ -1337,10 +1370,28 @@ async function main(): Promise<void> {
           await enterWorkspace()
           return { ok: true }
         },
-        loginGate: async () => ({ initialized: loginInitialized(desktopLoginDirectory()) }),
+        loginGate: async () => ({ initialized: gateway !== undefined || loginInitialized(desktopLoginDirectory()) }),
         submitLogin: async (input: WelcomeLoginInput) => {
-          const result = submitLocalLogin(desktopLoginDirectory(), input)
-          if (!result.ok) return result
+          if (gateway === undefined) {
+            const result = submitLocalLogin(desktopLoginDirectory(), input)
+            if (!result.ok) return result
+            finishLogin()
+            return { ok: true }
+          }
+          const outcome = await loginWithGateway(gateway, input)
+          if (!outcome.ok) return { ok: false, code: outcome.code, detail: outcome.detail }
+          if (welcomeBackend === undefined) {
+            return { ok: false, code: 'server', detail: '登录服务暂时不可用，请稍后再试' }
+          }
+          if (!(await welcomeBackend.save(outcome.token)).ok) {
+            return { ok: false, code: 'server', detail: '凭证未保存，请重试' }
+          }
+          recordGatewaySession(desktopLoginDirectory(), {
+            username: outcome.username,
+            displayName: outcome.displayName,
+            enterpriseKey: outcome.enterpriseKey,
+            expiresAt: outcome.expiresAt,
+          })
           finishLogin()
           return { ok: true }
         },
@@ -1400,12 +1451,13 @@ async function main(): Promise<void> {
   ipcMain.handle(DESKTOP_IPC.admit, async (event) => {
     assertProductSender(event)
     if (quitting) return
-    if (localSessionActive()) {
+    if (localSessionActive() && await gatewayCredentialStored()) {
       enteredWorkspace = true
       publishLocalUser()
       return
     }
     raiseAfterUpdate = false
+    if (gateway !== undefined) await welcomeBackend?.clear()
     await showWelcome()
     if (loginFinished) return
     await new Promise<void>((resolve) => { admitRelease = resolve })
@@ -1427,6 +1479,7 @@ async function main(): Promise<void> {
   ipcMain.handle(DESKTOP_IPC.localSignOut, async (event) => {
     assertProductSender(event)
     clearLocalSession(desktopLoginDirectory())
+    if (gateway !== undefined) await welcomeBackend?.clear()
     enteredWorkspace = false
     publishLocalUser()
     raiseAfterUpdate = false

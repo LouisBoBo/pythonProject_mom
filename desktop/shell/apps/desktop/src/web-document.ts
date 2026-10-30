@@ -1,6 +1,7 @@
 /** Local Web document and authenticated HTTP forwarding for the application window. */
 import { readFile } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
+import type { Cookie } from 'electron'
 
 const MIME: Readonly<Record<string, string>> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -51,6 +52,17 @@ export async function serveWebDocument(request: Request, root: string): Promise<
   return new Response(request.method === 'HEAD' ? null : content, {
     headers: { 'content-type': MIME[extname(target)] ?? 'application/octet-stream' },
   })
+}
+
+/**
+ * Recognize a Host authentication cookie left in the browser jar by an earlier launch.
+ * Every launch issues a fresh cookie name, Chromium resends all of them to the loopback Host,
+ * and the Host rejects request headers over Node's 16 KiB limit, so a launch eventually fails.
+ * @param cookie - Cookie stored for the loopback origin.
+ * @returns Whether the cookie authenticates a Host instance that is no longer running.
+ */
+export function isStaleHostAuthCookie(cookie: Cookie): boolean {
+  return (cookie.domain === '127.0.0.1' || cookie.domain === 'localhost') && cookie.name.startsWith('dsh-auth-')
 }
 
 /**
