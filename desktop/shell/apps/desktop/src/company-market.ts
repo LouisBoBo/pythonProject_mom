@@ -71,13 +71,27 @@ function writeCompanyMarketProfile(profileDir: string): void {
  * @param packaged - Whether Electron is running from an installer.
  * @param resourcesPath - Electron resources directory.
  * @param execPath - Electron executable, launched as Node.
+ * @param caFile - PEM bundle trusting the company CA that signs the market host; without it the
+ * bridge's HTTPS fetch of the catalog fails verification.
  */
-export function startCompanyMarketBridge(packaged: boolean, resourcesPath: string, execPath: string): void {
+export function startCompanyMarketBridge(
+  packaged: boolean,
+  resourcesPath: string,
+  execPath: string,
+  caFile?: string,
+): void {
   if (bridge !== undefined) return
   const script = companyMarketScript(packaged, resourcesPath)
   if (script === undefined) return
   bridge = spawn(execPath, [script], {
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1',
+      ...(() => {
+        const certPath = caFile?.trim() ?? ''
+        return certPath ? { NODE_EXTRA_CA_CERTS: certPath } : {}
+      })(),
+    },
     stdio: 'ignore',
     windowsHide: true,
   })

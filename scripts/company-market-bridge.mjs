@@ -1,7 +1,11 @@
 /**
  * Convert company plugins.json → DSH market index format 1, and serve it.
- * Catalog: http://175.178.238.31/dsh-plugins/plugins.json
- * npm:     http://175.178.238.31/dsh-plugins/npm/
+ * Catalog: https://175.178.238.31:8443/dsh-plugins/plugins.json
+ * npm:     https://175.178.238.31:8443/dsh-plugins/npm/
+ *
+ * The market files are served by the gateway's own TLS entry, not by port 80:
+ * the shared box gives 80 to whatever site is deployed there, and the catalog
+ * would silently start returning someone else's 404 page.
  *
  * This bridge only adapts market metadata. Plugin behavior/UI fixes belong in
  * each plugin's own repository — do not patch plugin code from this repo.
@@ -12,8 +16,9 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const CATALOG = process.env.ZR_DSH_MARKET_CATALOG ?? 'http://175.178.238.31/dsh-plugins/plugins.json'
-const NPM = (process.env.ZR_DSH_MARKET_NPM ?? 'http://175.178.238.31/dsh-plugins/npm/').replace(/\/?$/, '/')
+const MARKET_BASE = (process.env.ZR_DSH_MARKET_BASE ?? 'https://175.178.238.31:8443/dsh-plugins').replace(/\/?$/, '/')
+const CATALOG = process.env.ZR_DSH_MARKET_CATALOG ?? `${MARKET_BASE}plugins.json`
+const NPM = (process.env.ZR_DSH_MARKET_NPM ?? `${MARKET_BASE}npm/`).replace(/\/?$/, '/')
 const PUBLIC_NPM = (process.env.ZR_DSH_MARKET_PUBLIC_NPM ?? 'https://registry.npmmirror.com/').replace(/\/?$/, '/')
 const HOST = process.env.ZR_DSH_MARKET_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.ZR_DSH_MARKET_PORT ?? '13090')

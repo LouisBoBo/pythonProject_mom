@@ -15,7 +15,7 @@ import { SESSION_TTL_MS } from './local-login.ts'
  * Deployment address, used when `ZR_MODEL_GATEWAY_URL` is absent.
  * Set this in a build with a fixed gateway; leave empty to keep the feature off.
  */
-export const DEFAULT_GATEWAY_BASE_URL = 'https://175.178.238.31'
+export const DEFAULT_GATEWAY_BASE_URL = 'https://175.178.238.31:8443'
 
 /** pi-ai route name requests select; also the prefix of every alias. */
 export const GATEWAY_PROVIDER = 'zr-gateway'

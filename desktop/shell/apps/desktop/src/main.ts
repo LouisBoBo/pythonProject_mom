@@ -731,7 +731,7 @@ async function main(): Promise<void> {
         if (companyMarketScript(app.isPackaged, process.resourcesPath) !== undefined) {
           ensureCompanyMarketProfile(paths.profile)
         }
-        startCompanyMarketBridge(app.isPackaged, process.resourcesPath, process.execPath)
+        startCompanyMarketBridge(app.isPackaged, process.resourcesPath, process.execPath, hostEnvironment.NODE_EXTRA_CA_CERTS)
       })
       await hostReady
       if (backend.host !== undefined) {
