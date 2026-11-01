@@ -71,12 +71,16 @@ export function packageRegistryUrl(registry, name) {
 export function npmProxyTarget(requestPath, companyRegistry = NPM, publicRegistry = PUBLIC_NPM) {
   if (!requestPath.startsWith('/npm/')) throw new Error('rejected npm path')
   const suffix = requestPath.slice('/npm/'.length)
-  if (suffix === '' || suffix.includes('..') || suffix.includes('\\') || suffix.startsWith('/')) {
+  if (suffix === '' || suffix.includes('\\') || suffix.startsWith('/') || suffix.includes('\0')) {
     throw new Error('rejected npm path')
   }
   let decoded
   try { decoded = decodeURIComponent(suffix) } catch { throw new Error('rejected npm path') }
-  if (decoded.includes('..') || decoded.includes('\\') || decoded.startsWith('/')) throw new Error('rejected npm path')
+  if (decoded.includes('\\') || decoded.startsWith('/') || decoded.includes('\0')) throw new Error('rejected npm path')
+  // Guard against `.` / `..` / empty path segments (URL-encoded or literal).
+  const segmentBad = seg => seg === '.' || seg === '..' || seg === ''
+  for (const seg of suffix.split('/')) if (segmentBad(seg)) throw new Error('rejected npm path')
+  for (const seg of decoded.split('/')) if (segmentBad(seg)) throw new Error('rejected npm path')
   const base = decoded.startsWith('@zhongruan/') ? companyRegistry : publicRegistry
   const root = new URL(base.endsWith('/') ? base : `${base}/`)
   const target = new URL(suffix, root)
@@ -86,23 +90,52 @@ export function npmProxyTarget(requestPath, companyRegistry = NPM, publicRegistr
   return target.href
 }
 
+/** Decide whether a hostname resolves to a private, loopback, or otherwise blocked address.
+ *  WhatWG URL passes us the canonicalised hostname (e.g. [::ffff:127.0.0.1] → [::ffff:7f00:1]),
+ *  so the IPv4-mapped branch must read the packed 32-bit value after `::ffff:` as hex,
+ *  not re-match the original dotted-decimal form. */
 function blockedRedirectHost(hostname) {
   const host = hostname.replace(/^\[|\]$/g, '').toLowerCase()
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true
   if (host === '::1' || host === '0.0.0.0') return true
   if (host.includes(':')) {
-    return host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd') || host.startsWith('::ffff:127.') || host.startsWith('::ffff:10.') || host.startsWith('::ffff:192.168.') || host.startsWith('::ffff:169.254.') || host.startsWith('::ffff:0.')
+    if (host === '::1') return true
+    if (host.startsWith('fe80:')) return true
+    if (host.startsWith('fc') || host.startsWith('fd')) return true
+    // IPv4-mapped ::ffff:XXXX:XXXX — unpack the trailing 32-bit hex into an IPv4
+    if (host.startsWith('::ffff:')) {
+      const tail = host.slice('::ffff:'.length)
+      const hexMatch = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(tail)
+      if (hexMatch) {
+        const hi = parseInt(hexMatch[1], 16)
+        const lo = parseInt(hexMatch[2], 16)
+        return isPrivateIpv4Bits((hi << 16) | lo)
+      }
+      // Fallback: dotted-decimal form (some parsers keep it)
+      const dots = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(tail)
+      if (dots) return isPrivateIpv4Bits(
+        (Number(dots[1]) << 24) | (Number(dots[2]) << 16) | (Number(dots[3]) << 8) | Number(dots[4]),
+      )
+    }
+    return false
   }
   const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
   if (match === null) return false
   const parts = match.slice(1).map(Number)
   if (parts.some(part => part > 255)) return true
-  const a = parts[0]
-  const b = parts[1]
+  const packed = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+  return isPrivateIpv4Bits(packed)
+}
+
+/** Check packed 32-bit IPv4 integer against all private / loopback / reserved ranges. */
+function isPrivateIpv4Bits(packed) {
+  const a = (packed >>> 24) & 0xff
+  const b = (packed >>> 16) & 0xff
   if (a === 0 || a === 10 || a === 127) return true
   if (a === 169 && b === 254) return true
   if (a === 172 && b >= 16 && b <= 31) return true
   if (a === 192 && b === 168) return true
+  if (a >= 224) return true // multicast 224.0.0.0/4 + reserved 240.0.0.0/4
   return false
 }
 
