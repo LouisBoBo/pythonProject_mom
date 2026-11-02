@@ -350,6 +350,18 @@ vi.mock('../src/update-coordinator.ts', () => ({ DesktopUpdateCoordinator: class
   readonly install = harness.updateInstall
   readonly dispose = vi.fn()
 } }))
+// The company feed is the production choice; these tests exercise the shell around it.
+vi.mock('../src/mom-update-coordinator.ts', () => ({ DesktopMomUpdateCoordinator: class {
+  constructor(publish: (state: DesktopUpdateState) => DesktopUpdateState, beforeRestart: () => Promise<boolean>) {
+    harness.prepareUpdate = beforeRestart
+    harness.publishUpdate = publish
+  }
+  get state() { return harness.updateState }
+  readonly check = harness.updateCheck
+  readonly download = harness.updateDownload
+  readonly install = harness.updateInstall
+  readonly dispose = vi.fn()
+} }))
 vi.mock('../src/platform-view.ts', async importOriginal => ({
   ...await importOriginal<typeof import('../src/platform-view.ts')>(),
   DesktopPlatformView: class {

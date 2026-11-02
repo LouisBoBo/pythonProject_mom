@@ -27,6 +27,8 @@ apps/desktop/src/client/WelcomePage.tsx
 apps/desktop/src/host-process.ts
 apps/desktop/src/locale.ts
 apps/desktop/src/main.ts
+apps/desktop/src/mom-update-coordinator.ts
+apps/desktop/src/mom-update-feed.ts
 apps/desktop/src/paths.ts
 apps/desktop/src/preload-welcome.ts
 apps/desktop/src/welcome-api.ts

@@ -32,6 +32,7 @@ export const DESKTOP_IPC = {
   updatesStatus: 'dsh-desktop:updates-status',
   updatesOpen: 'dsh-desktop:updates-open',
   updatesPresentation: 'dsh-desktop:updates-presentation',
+  appVersion: 'dsh-desktop:app-version',
   nativeThemeSet: 'dsh-desktop:native-theme-set',
   windowFullscreen: 'dsh-desktop:window-fullscreen',
   windowsAppearance: 'dsh-desktop:windows-appearance',
@@ -89,6 +90,8 @@ export interface DshDesktopProductApi {
     open(): Promise<void>
     subscribe(listener: (state: DesktopUpdatePresentation) => void): () => void
   }
+  /** Installed application release version (the DMG/ZIP product version, not the runtime version). */
+  appVersion(): Promise<string>
 }
 
 /** Scheme of Desktop-owned application documents. */

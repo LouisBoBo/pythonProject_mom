@@ -12,3 +12,4 @@ build/
 .tmp/
 var/
 .codex-tasks/
+desktop/update-upload.env

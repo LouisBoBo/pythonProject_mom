@@ -126,6 +126,34 @@ if [[ -z "$dmg" ]]; then
   exit 1
 fi
 
+# The DMG is for manual installs; the ZIP is what the in-app updater downloads.
+# Derive the published version from the artifact name so the feed can never claim
+# a version the installer does not carry.
+dmg_base="$(basename "$dmg" .dmg)"
+version="${dmg_base#zr-dsh-}"
+version="${version%-${artifact_target}-unsigned}"
+if [[ "zr-dsh-${version}-${artifact_target}-unsigned" != "$dmg_base" ]]; then
+  echo "cannot derive version from $dmg_base" >&2
+  exit 1
+fi
+
+app="$(find "$artifact_dir" -maxdepth 3 -type d -name '*.app' -exec ls -td {} + 2>/dev/null | head -n 1)"
+if [[ -z "$app" ]]; then
+  echo "unsigned .app bundle was not produced in $artifact_dir" >&2
+  exit 1
+fi
+
 mkdir -p "$RepoRoot/dist"
 cp -f "$dmg" "$RepoRoot/dist/"
 echo "installer: $RepoRoot/dist/$(basename "$dmg")"
+
+zip="$RepoRoot/dist/$dmg_base.zip"
+rm -f "$zip"
+ditto -c -k --sequesterRsrc --keepParent "$app" "$zip"
+echo "update package: $zip"
+
+node "$DesktopRoot/update-feed.mjs" \
+  --platform macos \
+  --version "$version" \
+  --artifact "$zip" \
+  --out "$RepoRoot/dist"

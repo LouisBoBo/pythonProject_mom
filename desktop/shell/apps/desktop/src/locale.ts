@@ -116,6 +116,7 @@ export const en = {
   updateDownloadedTitle: 'Version {version} is ready to install',
   updateDownloadedDetail: 'The app will close during the update and reopen automatically when it is complete.',
   updateDownloadedDetailWindows: 'The app will close temporarily during the update and reopen automatically when it is complete.\n\nThe update may take some time. Please wait and do not launch the app again during installation.',
+  updateDownloadedDetailMacosManual: 'The app will close during the update. The new version will be shown in Finder; drag it into Applications to replace the old one.',
   updateClose: 'Close',
   updateAcknowledge: 'OK',
   updateLater: 'Update later',
@@ -287,6 +288,7 @@ export const zh = {
   updateDownloadedTitle: '新版本 {version} 已准备就绪',
   updateDownloadedDetail: '更新期间应用将暂时关闭，完成后会自动打开。',
   updateDownloadedDetailWindows: '更新期间应用将暂时关闭，完成后会自动打开。\n\n更新可能需要一些时间，请耐心等待，期间请勿重复启动应用。',
+  updateDownloadedDetailMacosManual: '更新期间应用将暂时关闭。新版会在 Finder 中显示，把它拖进「应用程序」替换旧版即可。',
   updateClose: '关闭',
   updateAcknowledge: '确定',
   updateLater: '稍后更新',
@@ -387,9 +389,14 @@ export function desktopUpdateReadyConfirmation(
   messages: DesktopMessages,
   version: string,
   platform: string,
+  manualMacInstall = false,
 ): { message: string; detail: string } {
   return {
     message: formatDesktopMessage(messages.updateDownloadedTitle, { version }),
-    detail: platform === 'win32' ? messages.updateDownloadedDetailWindows : messages.updateDownloadedDetail,
+    detail: platform === 'win32'
+      ? messages.updateDownloadedDetailWindows
+      : platform === 'darwin' && manualMacInstall
+        ? messages.updateDownloadedDetailMacosManual
+        : messages.updateDownloadedDetail,
   }
 }

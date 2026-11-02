@@ -153,6 +153,15 @@ vi.mock('../src/update-dialog.ts', () => ({ DesktopUpdateDialog: class {
 vi.mock('../src/update-coordinator.ts', () => ({ DesktopUpdateCoordinator: class {
   state = { phase: 'idle' }
   check = vi.fn(async () => this.state)
+  download = vi.fn(async () => this.state)
+  install = vi.fn(async () => this.state)
+  dispose = vi.fn()
+} }))
+vi.mock('../src/mom-update-coordinator.ts', () => ({ DesktopMomUpdateCoordinator: class {
+  state = { phase: 'idle' }
+  check = vi.fn(async () => this.state)
+  download = vi.fn(async () => this.state)
+  install = vi.fn(async () => this.state)
   dispose = vi.fn()
 } }))
 vi.mock('../src/welcome-window.ts', () => ({

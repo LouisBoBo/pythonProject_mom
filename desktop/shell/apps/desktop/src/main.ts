@@ -35,6 +35,8 @@ import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLoc
 import { claimDesktopSingleInstance } from './single-instance.ts'
 import { desktopUpdateChannel } from './update-channel.ts'
 import { DesktopUpdateCoordinator } from './update-coordinator.ts'
+import { DesktopMomUpdateCoordinator } from './mom-update-coordinator.ts'
+import { momUpdateFeedBase } from './mom-update-feed.ts'
 import { DesktopCommandManager } from './command-management.ts'
 import { serveWebDocument, authenticateWebHost, forwardWebRequest, isStaleHostAuthCookie } from './web-document.ts'
 import {
@@ -773,61 +775,71 @@ async function main(): Promise<void> {
 
   const manifest: unknown = JSON.parse(await readFile(join(app.getAppPath(), 'package.json'), 'utf8'))
   const updateChannel = desktopUpdateChannel(manifest)
-  const updates = new DesktopUpdateCoordinator(
-    publishUpdate,
-    async () => {
-      await commandManager.idle()
-      await workspaceRecovery
-      await startup?.catch(() => undefined)
-      const host = backend.host
-      if (host === undefined) throw new DesktopUpdatePreparationError('tasks-unavailable', locale.messages.updateTasksUnavailable)
-      const active = await host.updateTasks('inspect')
-      const ready = desktopUpdateReadyConfirmation(locale.messages, updates.state.version ?? '', process.platform)
-      const confirmation: Electron.MessageBoxOptions = {
-        type: active ? 'warning' : 'info', title: locale.messages.updateTitle,
-        message: active ? locale.messages.updateActiveTasks : ready.message,
-        detail: active ? locale.messages.updateActiveTasksDetail : ready.detail,
-        buttons: active ? [locale.messages.updateStopTasks, locale.messages.updateLater] : [locale.messages.installAndRestart],
-        defaultId: 1, cancelId: 1,
-      }
-      if (isMandatory()) {
-        if (!await mandatoryUI?.confirm(updates.state.version ?? '', active)) return false
-      } else {
-        const parent = currentDialogWindow()
-        if (parent === undefined) return false
-        const result = await updateDialog.show(parent, confirmation)
-        if (result.response !== 0 || isMandatory()) return false
-      }
-      // The update lock rejects new HTTP requests, including analytics intake.
-      await track('desktop_upgrade_install_restart_click', {})
-      if (backend.host !== host) throw new DesktopUpdatePreparationError('tasks-unavailable', locale.messages.updateTasksUnavailable)
-      try {
-        const stillActive = await host.updateTasks('lock')
-        if (stillActive && !active) throw new DesktopUpdatePreparationError('tasks-changed', locale.messages.updateTasksChanged)
-        mandatoryUI?.preparingRestart(stillActive)
-        // The embedded Platform document holds credentials issued by the Host that is about to stop.
-        await platformView.closeAndWait()
-        requireCleanStop = true
-        updateStopFailure = undefined
-        await backend.stop()
-        updateStoppedHost = true
-        // The backend's async cleanup callback can assign this after the reset above.
-        const stopFailure = updateStopFailure as DesktopHostUncleanExitError | undefined
-        if (stopFailure !== undefined) throw new DesktopUpdatePreparationError('stop-failed', locale.messages.updateStopFailed, stopFailure.message)
-        updateJournal?.action('install-confirmed')
-        shellInstallerOwnsQuit = true
-      } catch (error) {
-        if (!updateStoppedHost) await host.updateTasks('unlock').catch((unlockError: unknown) => { console.error(unlockError) })
-        throw error
-      } finally {
-        requireCleanStop = false
-      }
-      return true
-    },
-    undefined, undefined, undefined,
-    (success, reason) => { void track('desktop_upgrade_download_result', { is_success: success, ...reason === undefined ? {} : { error_reason: reason } }) },
-    updateChannel,
-  )
+  // Company feed installs on macOS are manual: the unsigned app is revealed in Finder.
+  const companyUpdateFeed = momUpdateFeedBase() !== undefined
+  const beforeInstallRestart = async (): Promise<boolean> => {
+    await commandManager.idle()
+    await workspaceRecovery
+    await startup?.catch(() => undefined)
+    const host = backend.host
+    if (host === undefined) throw new DesktopUpdatePreparationError('tasks-unavailable', locale.messages.updateTasksUnavailable)
+    const active = await host.updateTasks('inspect')
+    const ready = desktopUpdateReadyConfirmation(locale.messages, updateState.version ?? '', process.platform, companyUpdateFeed)
+    const confirmation: Electron.MessageBoxOptions = {
+      type: active ? 'warning' : 'info', title: locale.messages.updateTitle,
+      message: active ? locale.messages.updateActiveTasks : ready.message,
+      detail: active ? locale.messages.updateActiveTasksDetail : ready.detail,
+      buttons: active ? [locale.messages.updateStopTasks, locale.messages.updateLater] : [locale.messages.installAndRestart],
+      defaultId: 1, cancelId: 1,
+    }
+    if (isMandatory()) {
+      if (!await mandatoryUI?.confirm(updateState.version ?? '', active)) return false
+    } else {
+      const parent = currentDialogWindow()
+      if (parent === undefined) return false
+      const result = await updateDialog.show(parent, confirmation)
+      if (result.response !== 0 || isMandatory()) return false
+    }
+    // The update lock rejects new HTTP requests, including analytics intake.
+    await track('desktop_upgrade_install_restart_click', {})
+    if (backend.host !== host) throw new DesktopUpdatePreparationError('tasks-unavailable', locale.messages.updateTasksUnavailable)
+    try {
+      const stillActive = await host.updateTasks('lock')
+      if (stillActive && !active) throw new DesktopUpdatePreparationError('tasks-changed', locale.messages.updateTasksChanged)
+      mandatoryUI?.preparingRestart(stillActive)
+      // The embedded Platform document holds credentials issued by the Host that is about to stop.
+      await platformView.closeAndWait()
+      requireCleanStop = true
+      updateStopFailure = undefined
+      await backend.stop()
+      updateStoppedHost = true
+      // The backend's async cleanup callback can assign this after the reset above.
+      const stopFailure = updateStopFailure as DesktopHostUncleanExitError | undefined
+      if (stopFailure !== undefined) throw new DesktopUpdatePreparationError('stop-failed', locale.messages.updateStopFailed, stopFailure.message)
+      updateJournal?.action('install-confirmed')
+      shellInstallerOwnsQuit = true
+    } catch (error) {
+      if (!updateStoppedHost) await host.updateTasks('unlock').catch((unlockError: unknown) => { console.error(unlockError) })
+      throw error
+    } finally {
+      requireCleanStop = false
+    }
+    return true
+  }
+  const trackUpdateDownload = (success: boolean, reason?: string): void => {
+    void track('desktop_upgrade_download_result', { is_success: success, ...reason === undefined ? {} : { error_reason: reason } })
+  }
+  // Unsigned builds have no electron-updater source; the company feed replaces it while
+  // keeping the existing update UI, dialogs, task-locking, and journal unchanged.
+  const updates = companyUpdateFeed
+    ? new DesktopMomUpdateCoordinator(publishUpdate, beforeInstallRestart, trackUpdateDownload)
+    : new DesktopUpdateCoordinator(
+        publishUpdate,
+        beforeInstallRestart,
+        undefined, undefined, undefined,
+        trackUpdateDownload,
+        updateChannel,
+      )
 
   const updateSchedule = new DesktopUpdateSchedule(updates, resolveDesktopUpdateScheduleConfig(process.env))
 
@@ -1007,6 +1019,10 @@ async function main(): Promise<void> {
   ipcMain.handle(DESKTOP_IPC.updatesOpen, async (event) => {
     assertProductSender(event)
     await openUpdatePrompt()
+  })
+  ipcMain.handle(DESKTOP_IPC.appVersion, (event) => {
+    assertProductSender(event)
+    return app.getVersion()
   })
 
   let promptOperation: Promise<void> | undefined
