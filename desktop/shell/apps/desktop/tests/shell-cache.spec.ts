@@ -7,7 +7,9 @@ import {
   desktopBootCanContinue,
   desktopShellSnapshot,
   desktopShellSnapshotPath,
+  pluginScriptRevisions,
   readDesktopShellSnapshot,
+  rewriteStalePluginRevision,
   sameShellScripts,
   serveCachedShellScript,
   shellScriptKey,
@@ -85,5 +87,35 @@ describe('desktop shell snapshot', () => {
     expect(desktopBootCanContinue(pending)).toBe(true)
     expect(desktopBootCanContinue('web boot: 1 entry did not activate\nlocale: failed')).toBe(false)
     expect(desktopBootCanContinue('web boot: 1 entry did not activate\nlocale: import failed: missing')).toBe(false)
+  })
+
+  it('reads live revisions from the boot graph', () => {
+    const revisions = pluginScriptRevisions([
+      { kind: 'global', name: '__DSH_BOOT__', value: { entries: [
+        { id: '@scope/preview', url: 'plugins/??@scope/preview/client.js&rev=new', rev: 'new' },
+        { id: '@scope/other', url: 'plugins/??@scope/other/client.js&rev=b', rev: 'b' },
+      ], batches: [{ phase: 'bootstrap', rev: 'batch' }] } },
+    ])
+    expect([...revisions]).toEqual([['@scope/preview', 'new'], ['@scope/other', 'b']])
+  })
+
+  it('rewrites only stale on-demand chunk revisions', () => {
+    const revisions = pluginScriptRevisions([{ value: { entries: [{ id: '@scope/preview', rev: 'live' }] } }])
+    const stale = rewriteStalePluginRevision(
+      new Request('dsh-app://app/plugins/@scope/preview/client.pdf.js?rev=cached', {
+        headers: { origin: 'dsh-app://app' },
+      }),
+      revisions,
+    )
+    expect(stale.url).toBe('dsh-app://app/plugins/@scope/preview/client.pdf.js?rev=live')
+    expect(stale.headers.get('origin')).toBe('dsh-app://app')
+    const current = new Request('dsh-app://app/plugins/@scope/preview/client.pdf.js?rev=live')
+    expect(rewriteStalePluginRevision(current, revisions)).toBe(current)
+    const combo = new Request('dsh-app://app/plugins/??@scope/preview/client.js&rev=cached')
+    expect(rewriteStalePluginRevision(combo, revisions)).toBe(combo)
+    const unknown = new Request('dsh-app://app/plugins/@scope/missing/client.js?rev=cached')
+    expect(rewriteStalePluginRevision(unknown, revisions)).toBe(unknown)
+    const unversioned = new Request('dsh-app://app/plugins/@scope/preview/client.pdf.js')
+    expect(rewriteStalePluginRevision(unversioned, revisions)).toBe(unversioned)
   })
 })

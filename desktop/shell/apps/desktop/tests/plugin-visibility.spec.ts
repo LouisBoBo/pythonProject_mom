@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { bootScriptsChanged, profilePluginSignature, watchProfilePlugins } from '../src/plugin-visibility.ts'
+import { bootScriptsChanged, profilePluginSignature, quarantineShadowedRuntimePackages, watchProfilePlugins } from '../src/plugin-visibility.ts'
 
 const directories: string[] = []
 
@@ -18,6 +18,11 @@ function profile(): string {
 
 function manifest(bundles: string[], dependencies: Record<string, string> = {}): string {
   return `${JSON.stringify({ dependencies, dsh: { profile: { bundles } } }, undefined, 2)}\n`
+}
+
+function packageAt(directory: string, version: string): void {
+  mkdirSync(directory, { recursive: true })
+  writeFileSync(join(directory, 'package.json'), JSON.stringify({ name: 'fixture', version }))
 }
 
 describe('profile plugin signature', () => {
@@ -36,6 +41,36 @@ describe('profile plugin signature', () => {
     expect(bootScriptsChanged(undefined, added)).toBe(false)
     expect(bootScriptsChanged(booted, same)).toBe(false)
     expect(bootScriptsChanged(booted, added)).toBe(true)
+  })
+})
+
+describe('runtime package shadowing', () => {
+  it('quarantines only profile copies whose version differs from the installation', () => {
+    const root = profile()
+    const dsh = join(root, 'dsh')
+    const profileDir = join(root, 'profile')
+    packageAt(join(dsh, 'node_modules', '@deepseek-ai', 'dsh-tools'), '0.2.1-rc.2')
+    packageAt(join(dsh, 'node_modules', '@deepseek-ai', 'cordis'), '4.0.5')
+    packageAt(join(profileDir, 'node_modules', '@deepseek-ai', 'dsh-tools'), '0.1.1-rc.2')
+    packageAt(join(profileDir, 'node_modules', '@deepseek-ai', 'cordis'), '4.0.5')
+    packageAt(join(profileDir, 'node_modules', '@deepseek-ai', 'company-only'), '1.0.0')
+
+    const moved = quarantineShadowedRuntimePackages(profileDir, dsh)
+
+    expect(moved).toEqual(['dsh-tools@0.1.1-rc.2 (runtime 0.2.1-rc.2)'])
+    expect(existsSync(join(profileDir, 'node_modules', '@deepseek-ai', 'dsh-tools'))).toBe(false)
+    expect(existsSync(join(profileDir, 'node_modules', '@deepseek-ai', 'cordis'))).toBe(true)
+    expect(existsSync(join(profileDir, 'node_modules', '@deepseek-ai', 'company-only'))).toBe(true)
+    const kept = readdirSync(join(profileDir, '.desktop-quarantine'))
+    expect(kept).toHaveLength(1)
+    expect(kept[0]).toMatch(/^dsh-tools-0\.1\.1-rc\.2-/)
+  })
+
+  it('does nothing without a profile scope', () => {
+    const root = profile()
+    const dsh = join(root, 'dsh')
+    packageAt(join(dsh, 'node_modules', '@deepseek-ai', 'dsh-tools'), '0.2.1-rc.2')
+    expect(quarantineShadowedRuntimePackages(join(root, 'profile'), dsh)).toEqual([])
   })
 })
 

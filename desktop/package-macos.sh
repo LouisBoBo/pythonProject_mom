@@ -99,71 +99,9 @@ if [[ ! -f "$BuildRoot/node_modules/.modules.yaml" ]]; then
   )
 fi
 
-# --- 额外依赖：对话写码插件 + Cursor SDK ---
-# pnpm install --frozen-lockfile 只装上游仓库原始依赖树；
-# 下面两个包需要从公司 registry 拉，且不在上游 lockfile 里。
-# 这里在 frozen-lockfile 之后追加安装，保持 BuildRoot 原始 lockfile 不变。
-# 注意: Cursor SDK native binding 命名用 x64/arm64，和 uname -m 的 x86_64/arm64 不同。
-# NOTE: @zhongruan/dsh-cursor-chat 用本地 tgz（未发布到公司 registry 时的 fallback）
-LocalPluginTgz="/tmp/zhongruan-dsh-cursor-chat-0.2.0.tgz"
-DshPluginRegistry="${DSH_PLUGIN_REGISTRY:-http://175.178.238.31/dsh-plugins/npm/}"
-DshNpmRegistry="${DSH_DESKTOP_NPM_REGISTRY:-https://registry.npmmirror.com}"
-CursorSdkVer="1.0.31"
-CursorPluginVer="0.2.0"
-# 优先用本地 tgz（包含最新删除流水线代码），没有则从 registry 拉
-if [[ -f "$LocalPluginTgz" ]]; then
-  PluginInstallSpec="$LocalPluginTgz"
-else
-  PluginInstallSpec="@zhongruan/dsh-cursor-chat@$CursorPluginVer"
-fi
-case "$(uname -m)" in
-  x86_64) CursorArch="x64" ;;
-  arm64)  CursorArch="arm64" ;;
-  *)      CursorArch="$(uname -m)" ;;
-esac
-CursorNative="@cursor/sdk-darwin-$CursorArch"
-
-needs_extra_install=0
-# 检查插件目录存在 AND 包含我们期望的新文件（避免旧版 0.1.8 残留被跳过）
-if [[ ! -d "$BuildRoot/node_modules/@zhongruan/dsh-cursor-chat/lib" ]]; then
-  needs_extra_install=1
-elif [[ ! -f "$BuildRoot/node_modules/@zhongruan/dsh-cursor-chat/lib/deleteEnforce.js" ]]; then
-  echo "旧版 dsh-cursor-chat 残留（缺少 deleteEnforce.js），强制重装"
-  needs_extra_install=1
-  # 清掉让 pnpm add 重装
-  rm -rf "$BuildRoot/node_modules/@zhongruan/dsh-cursor-chat" 2>/dev/null
-fi
-if [[ ! -d "$BuildRoot/node_modules/@cursor/sdk" ]]; then
-  needs_extra_install=1
-fi
-if [[ ! -d "$BuildRoot/node_modules/$CursorNative" ]]; then
-  needs_extra_install=1
-fi
-
-if [[ "$needs_extra_install" -eq 1 ]]; then
-  echo "installing extra dependencies: dsh-cursor-chat + cursor-sdk (native: $CursorNative)"
-  # scope-based .npmrc: @zhongruan 从公司 registry，其余从镜像
-  cat > "$BuildRoot/.npmrc" <<EOF
-@zhongruan:registry=$DshPluginRegistry
-@cursor:registry=$DshNpmRegistry
-registry=$DshNpmRegistry
-fetch-timeout=120000
-fetch-retries=3
-network-concurrency=4
-EOF
-  (
-    cd "$BuildRoot"
-    corepack pnpm add -Dw \
-      "$PluginInstallSpec" \
-      "@cursor/sdk@$CursorSdkVer" \
-      "$CursorNative@$CursorSdkVer" \
-      --fetch-timeout 120000 --fetch-retries 3 --network-concurrency 4
-  )
-  if [[ $? -ne 0 ]]; then
-    echo "failed to install cursor-chat plugin dependencies" >&2
-    exit 1
-  fi
-fi
+# 公司插件（@zhongruan/*）一律由插件市场装进 profile，不随应用打包。
+# 安装目录里的旧副本会先于 profile 被解析，导致市场把已是最新的插件永远显示为“可更新”。
+# 这里只打上游桌面端；插件依赖由 profile 自己的 .npmrc + pnpm 负责。
 
 case "$(uname -m)" in
   x86_64) script_target="mac:x64"; artifact_target="mac-x64" ;;
@@ -175,11 +113,6 @@ case "$(uname -m)" in
 esac
 
 python3 "$DesktopRoot/prefetch-macos-runtime.py" "$BuildRoot" "$artifact_target"
-
-# Tell mom's prepare-dsh.ts overlay where the real BuildRoot is, so it can
-# additionally copy @cursor/* + @zhongruan/* from BuildRoot root node_modules
-# into the dsh runtime (those packages are NOT in the pre-packaged package-set tarballs).
-export MOM_BUILD_ROOT="$BuildRoot"
 
 (
   cd "$BuildRoot"

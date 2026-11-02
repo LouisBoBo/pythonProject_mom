@@ -41,15 +41,17 @@ import {
   DESKTOP_SHELL_PENDING_ORIGIN,
   captureDesktopShellSnapshot,
   desktopBootCanContinue,
+  pluginScriptRevisions,
   readDesktopLocalePreference,
   readDesktopShellSnapshot,
+  rewriteStalePluginRevision,
   serveCachedShellScript,
   shellScriptKeys,
   writeDesktopLocalePreference,
   writeDesktopShellSnapshot,
   type DesktopShellSnapshot,
 } from './shell-cache.ts'
-import { bootScriptsChanged, watchProfilePlugins } from './plugin-visibility.ts'
+import { bootScriptsChanged, quarantineShadowedRuntimePackages, watchProfilePlugins } from './plugin-visibility.ts'
 import { DesktopFatalRecovery } from './fatal-recovery.ts'
 import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
 import { mountWelcomeView, type WelcomeSurface } from './welcome-window.ts'
@@ -454,11 +456,14 @@ async function main(): Promise<void> {
   let hostCookie: string | undefined
   const browserGuests = new DesktopBrowserGuests(() => hostUrl)
   let injections: readonly unknown[] = []
+  let pluginRevisions: ReadonlyMap<string, string> = new Map()
   let bootedScriptKeys: readonly string[] | undefined
   let shellSnapshot: DesktopShellSnapshot | undefined
   let shellSnapshotLoaded = false
   let servedCachedShell = false
   let pluginApply = false
+  /** Plugin-manager calls on the wire; the profile watcher must not restart the Host under them. */
+  let pluginRequests = 0
   let pluginWatch: { close(): void } | undefined
   let applyInstalledPlugins: () => Promise<boolean> = async () => false
   const currentShellSnapshot = (): DesktopShellSnapshot | undefined => {
@@ -547,6 +552,10 @@ async function main(): Promise<void> {
       resources, (next) => { platformView.setSession(next) })
     return {
       start: async () => {
+        // Installing a plugin runs pnpm over the whole profile, which can hoist a pinned runtime
+        // package next to the installation's own copy and shadow it for every plugin.
+        const shadowed = quarantineShadowedRuntimePackages(paths.profile, resources.dsh)
+        if (shadowed.length > 0) console.warn(`desktop profile: quarantined shadowing runtime packages: ${shadowed.join(', ')}`)
         const ready = await host.start()
         await discardStaleHostAuthCookies()
         hostCookie = await authenticateWebHost(ready.url)
@@ -554,6 +563,7 @@ async function main(): Promise<void> {
         publishHostOrigin(new URL(ready.url).origin)
         if (ready.injections === undefined) throw new Error('Desktop Host did not provide boot injections')
         injections = ready.injections
+        pluginRevisions = pluginScriptRevisions(injections)
         refreshRunningShell()
         if (pluginWatch === undefined) pluginWatch = watchProfilePlugins(paths.profile, () => applyInstalledPlugins())
         void captureDesktopShellSnapshot(app.getVersion(), ready.url, hostCookie, injections, (input, init) => net.fetch(input, init))
@@ -620,6 +630,19 @@ async function main(): Promise<void> {
   // Restarting that Host and loading the window again is what makes the new sidebar appear.
   applyInstalledPlugins = async (): Promise<boolean> => {
     if (quitting || shuttingDown || pluginApply || backend.host === undefined) return false
+    // Wait until the plugin calls the change started have finished, plus a quiet moment for the next
+    // one: stopping the Host in that gap turns the follow-up install or enable into a 503 and leaves
+    // the profile half-applied, while the lock already keeps a single run from being cut off.
+    while (!quitting && !shuttingDown) {
+      if (pluginRequests > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        continue
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      if (pluginRequests === 0) break
+    }
+    // Two watcher ticks can reach the wait together; only one of them may own the restart.
+    if (quitting || shuttingDown || pluginApply) return false
     pluginApply = true
     let hostReady: Promise<void> | undefined
     try {
@@ -731,7 +754,8 @@ async function main(): Promise<void> {
         if (companyMarketScript(app.isPackaged, process.resourcesPath) !== undefined) {
           ensureCompanyMarketProfile(paths.profile)
         }
-        startCompanyMarketBridge(app.isPackaged, process.resourcesPath, process.execPath, hostEnvironment.NODE_EXTRA_CA_CERTS)
+        startCompanyMarketBridge(app.isPackaged, process.resourcesPath, process.execPath, hostEnvironment.NODE_EXTRA_CA_CERTS,
+          join(app.getPath('userData'), 'company-market', 'index.json'))
       })
       await hostReady
       if (backend.host !== undefined) {
@@ -842,7 +866,15 @@ async function main(): Promise<void> {
         if (url.pathname.startsWith('/plugins')) console.error(`dsh desktop: shell cache miss ${url.pathname}${url.search}`)
         return Promise.resolve(new Response(null, { status: 503 }))
       }
-      return forwardWebRequest(request, hostUrl, hostCookie)
+      // A page that painted from the previous launch's snapshot still asks for its on-demand
+      // chunks under that snapshot's revisions; inside app.asar those differ every launch.
+      const forwarded = rewriteStalePluginRevision(request, pluginRevisions)
+      // A change to the profile is written under the Host's package.json lock, and the calls it triggers
+      // (an update's removal, then its installation and enable) arrive within moments of each other.
+      // Count them so `applyInstalledPlugins` restarts the Host only after that sequence has drained.
+      if (!url.pathname.startsWith('/api/pluginManager/')) return forwardWebRequest(forwarded, hostUrl, hostCookie)
+      pluginRequests += 1
+      return forwardWebRequest(forwarded, hostUrl, hostCookie).finally(() => { pluginRequests -= 1 })
     }
     return Promise.resolve(new Response(null, { status: 404 }))
   })

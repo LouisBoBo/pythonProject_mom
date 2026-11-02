@@ -61,6 +61,61 @@ export function shellScriptKey(src: string): string | undefined {
 }
 
 /**
+ * Bundle revisions each boot entry advertises, keyed by package id.
+ *
+ * The Host derives a revision from filesystem metadata. Inside `app.asar` Node reports the
+ * launch time as that metadata, so every launch advertises different revisions than the
+ * snapshot saved by the previous launch. On-demand chunks (`client.pdf.js`) are not part of
+ * the snapshot, so their snapshot-stamped URL only loads when rewritten to the live revision.
+ * @param injections - Boot rows, either live or restored from a snapshot.
+ * @returns package id to live bundle revision.
+ */
+export function pluginScriptRevisions(injections: readonly unknown[]): Map<string, string> {
+  const revisions = new Map<string, string>()
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item)
+      return
+    }
+    if (typeof value !== 'object' || value === null) return
+    const record = value as { id?: unknown, rev?: unknown }
+    if (typeof record.id === 'string' && typeof record.rev === 'string') {
+      revisions.set(record.id, record.rev)
+      return
+    }
+    for (const item of Object.values(value)) visit(item)
+  }
+  visit(injections)
+  return revisions
+}
+
+/**
+ * Point an on-demand plugin chunk request at the revision the live Host serves.
+ *
+ * Combo batches and URLs without a revision are left alone: the snapshot answers those by
+ * exact key, and the Host rejects anything else.
+ * @param request - Application request.
+ * @param revisions - Live entry revisions from {@link pluginScriptRevisions}.
+ * @returns the request to forward, rewritten only when its package has a live revision.
+ */
+export function rewriteStalePluginRevision(
+  request: Request,
+  revisions: ReadonlyMap<string, string>,
+): Request {
+  if (revisions.size === 0 || !['GET', 'HEAD'].includes(request.method)) return request
+  const url = new URL(request.url)
+  if (!url.pathname.startsWith('/plugins/') || url.pathname.startsWith('/plugins/??')) return request
+  if (!url.searchParams.has('rev')) return request
+  for (const [id, rev] of revisions) {
+    if (!url.pathname.startsWith(`/plugins/${id}/`)) continue
+    if (url.searchParams.get('rev') === rev) return request
+    url.searchParams.set('rev', rev)
+    return new Request(url, request)
+  }
+  return request
+}
+
+/**
  * Every plugin URL named by the boot rows, including the graph's application batches.
  * @param injections - Host boot rows.
  * @returns stable unique route keys.

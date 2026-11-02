@@ -1,6 +1,6 @@
 /** Apply an installed plugin to the already-open desktop window. */
 
-import { existsSync, readFileSync, watch, type FSWatcher } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, watch, type FSWatcher } from 'node:fs'
 import { join } from 'node:path'
 import { shellScriptKeys } from './shell-cache.ts'
 
@@ -51,6 +51,56 @@ export function sameScriptKeyList(left: readonly string[], right: readonly strin
 export function bootScriptsChanged(booted: readonly string[] | undefined, injections: readonly unknown[]): boolean {
   if (booted === undefined) return false
   return !sameScriptKeyList(booted, shellScriptKeys(injections))
+}
+
+/**
+ * Move profile copies of the installation's runtime packages aside when their version differs.
+ * Node resolves profile packages before the runtime resolution, so a plugin that pins a private
+ * runtime dependency shadows the matching installation copy for every other plugin too — an
+ * `@deepseek-ai/dsh-tools@0.1.1-rc.2` hoisted by a company plugin makes the enabled cursor-chat
+ * import fail against the installation's 0.2.x `dsh-llm`. The runtime already supplies its own
+ * packages, so quarantining the shadow restores the pairing without disabling the plugin.
+ * @param profileDir - Desktop profile directory.
+ * @param dshDir - Installation directory; its `node_modules` is the runtime resolution.
+ * @param quarantineDir - Where the shadowed copies are kept for inspection.
+ * @returns the moved `name@version (runtime version)` entries, for logging.
+ */
+export function quarantineShadowedRuntimePackages(
+  profileDir: string,
+  dshDir: string,
+  quarantineDir = join(profileDir, '.desktop-quarantine'),
+): string[] {
+  const runtimeScope = join(dshDir, 'node_modules', '@deepseek-ai')
+  const profileScope = join(profileDir, 'node_modules', '@deepseek-ai')
+  let names: string[]
+  try { names = readdirSync(runtimeScope) } catch { return [] }
+  const moved: string[] = []
+  for (const name of names) {
+    const installed = join(profileScope, name)
+    if (!existsSync(installed)) continue
+    const runtimeVersion = packageVersion(join(runtimeScope, name))
+    const profileVersion = packageVersion(installed)
+    if (runtimeVersion === undefined || profileVersion === runtimeVersion) continue
+    try {
+      mkdirSync(quarantineDir, { recursive: true })
+      renameSync(installed, join(quarantineDir, `${name}-${profileVersion ?? 'unknown'}-${Date.now()}`))
+      moved.push(`${name}@${profileVersion ?? 'unknown'} (runtime ${runtimeVersion})`)
+    } catch {
+      // A failed move must not keep the Host from starting; the Host will report the real import error.
+    }
+  }
+  return moved
+}
+
+function packageVersion(directory: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'))
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    const version = (parsed as { version?: unknown }).version
+    return typeof version === 'string' ? version : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**

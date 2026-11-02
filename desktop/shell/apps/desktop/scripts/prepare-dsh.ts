@@ -1,21 +1,9 @@
-/** Materialize the complete production runtime before publishing Desktop resources.
- *
- * MOM OVERLAY: This file overrides the upstream BuildRoot prepare-dsh.ts to also
- * copy plugin + SDK packages that exist in the BuildRoot root node_modules but
- * are NOT in the pre-packaged package-set tarballs. Specifically:
- *   - @cursor/sdk + @cursor/sdk-darwin-x64   (Cursor Local Agent npm SDK)
- *   - @zhongruan/dsh-cursor-chat             (DSH Cordis plugin)
- *
- * These are installed by mom's package-macos.sh into BuildRoot root node_modules
- * BEFORE the packaging pipeline runs. Upstream's prepare-dsh.ts rebuilds the
- * runtime from scratch in a temp dir using only package-set tarballs, so our
- * external packages get lost. We copy them in after runtime:materialize-modules.
- */
+/** Materialize the complete production runtime before publishing Desktop resources. */
 
 import { resolveMacOSSignatureCacheDirectory } from './macos-signature-cache-directory.mjs'
 import { packagingStep } from './packaging-step.mjs'
 import { spawn } from 'node:child_process'
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, join, relative, resolve } from 'node:path'
 import { desktopNodeEnvironment } from '../src/node-environment.ts'
@@ -59,13 +47,6 @@ const PNPM_BUILD_STATE = BUILD_PATHS.dshPnpm
 const PACKAGE_SET_ROOT = BUILD_PATHS.packageSet
 const NODE = join(BUILD_PATHS.electron, process.platform === 'win32' ? 'electron.exe' : 'Electron.app/Contents/MacOS/Electron')
 const PNPM = join(RUNTIME_ROOT, 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs')
-
-// --- MOM OVERLAY EXTRA CONFIG ---
-// Mom installs external packages (@cursor/*, @zhongruan/*) into the REAL BuildRoot
-// node_modules before running the pipeline. We read that path from env.
-const MOM_BUILD_ROOT = process.env.MOM_BUILD_ROOT
-// Scopes we want to additionally copy from MOM_BUILD_ROOT/node_modules/
-const MOM_EXTRA_SCOPES: readonly string[] = ['@cursor', '@zhongruan']
 
 function manifestVersion(path: string, subject: string): string {
   const manifest = JSON.parse(readFileSync(path, 'utf8')) as { version?: unknown }
@@ -166,50 +147,6 @@ async function main(): Promise<void> {
         filter: source => desktopRuntimeFileExclusion(relative(modules, source), target, officeEngine) === undefined,
       })
     })
-
-    // ========== MOM OVERLAY BEGIN ==========
-    // Copy external packages (@cursor/*, @zhongruan/*) from BuildRoot root node_modules
-    // into the prepared dsh runtime. These are installed by mom's package-macos.sh
-    // but upstream's prepare-dsh.ts can't see them because it rebuilds runtime from tarballs only.
-    //
-    // pnpm node_modules uses symlinks: e.g. node_modules/@cursor/sdk -> .pnpm/@cursor+sdk@1.0.31/...
-    // We MUST resolve each sub-package to its real path first, then cpSync that real directory.
-    // cpSync with dereference:true on the scope directory itself does NOT follow into
-    // pnpm-style nested symlinks reliably.
-    if (MOM_BUILD_ROOT) {
-      for (const scope of MOM_EXTRA_SCOPES) {
-        const scopeDir = join(MOM_BUILD_ROOT, 'node_modules', scope)
-        if (!existsSync(scopeDir)) {
-          console.warn(`[mom-overlay] ${scope} not found in BuildRoot node_modules, skipping`)
-          continue
-        }
-        const targetScopeDir = join(DSH_OUTPUT_ROOT, 'node_modules', scope)
-        mkdirSync(targetScopeDir, { recursive: true })
-        // For each sub-package in the scope, resolve symlink → realpath → cpSync
-        for (const entry of readdirSync(scopeDir, { withFileTypes: true })) {
-          if (entry.name === '.' || entry.name === '..') continue
-          const entryPath = join(scopeDir, entry.name)
-          let realPath = entryPath
-          if (entry.isSymbolicLink()) {
-            try { realPath = realpathSync(entryPath) } catch {
-              console.warn(`[mom-overlay] ${scope}/${entry.name}: symlink broken, skipping`)
-              continue
-            }
-          }
-          if (!existsSync(realPath)) {
-            console.warn(`[mom-overlay] ${scope}/${entry.name}: target missing at ${realPath}, skipping`)
-            continue
-          }
-          const destPath = join(targetScopeDir, entry.name)
-          if (existsSync(destPath)) rmSync(destPath, { recursive: true, force: true })
-          cpSync(realPath, destPath, { recursive: true, force: true })
-          console.log(`[mom-overlay] copied ${scope}/${entry.name} (from ${realPath}) → dsh runtime`)
-        }
-      }
-    } else {
-      console.info('[mom-overlay] MOM_BUILD_ROOT not set, skipping extra package copy')
-    }
-    // ========== MOM OVERLAY END ==========
 
     writeFileSync(join(DSH_OUTPUT_ROOT, 'package.json'), `${JSON.stringify({
       name: '@deepseek-ai/dsh-desktop-runtime', private: true, version: release.version, type: 'module',

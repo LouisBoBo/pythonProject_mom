@@ -43,6 +43,10 @@ packages/api/gateway/src/index.ts
 packages/client/ui-conversation/src/client/locales.ts
 packages/client/ui-conversation/src/client/skeleton/EmptyHero.tsx
 packages/client/ui-layout/src/client/index.ts
+packages/client/ui-plugin-manager/src/client/manager-store.ts
+packages/client/ui-plugin-market/src/client/DiscoverSection.tsx
+packages/client/ui-plugin-market/src/client/locales.ts
+packages/client/ui-plugin-market/tests/discover.client.spec.tsx
 packages/client/ui-primitives/src/BrandWordmark.tsx
 packages/client/ui-primitives/src/FishLogo.tsx
 packages/client/ui-settings-general/src/client/locales.ts

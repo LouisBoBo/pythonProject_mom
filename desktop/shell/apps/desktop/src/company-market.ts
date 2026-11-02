@@ -73,12 +73,15 @@ function writeCompanyMarketProfile(profileDir: string): void {
  * @param execPath - Electron executable, launched as Node.
  * @param caFile - PEM bundle trusting the company CA that signs the market host; without it the
  * bridge's HTTPS fetch of the catalog fails verification.
+ * @param outFile - Where the bridge writes the index. It must be writable: the script sits inside
+ * the signed bundle, and its default path would add files there and break the code signature.
  */
 export function startCompanyMarketBridge(
   packaged: boolean,
   resourcesPath: string,
   execPath: string,
   caFile?: string,
+  outFile?: string,
 ): void {
   if (bridge !== undefined) return
   const script = companyMarketScript(packaged, resourcesPath)
@@ -90,6 +93,10 @@ export function startCompanyMarketBridge(
       ...(() => {
         const certPath = caFile?.trim() ?? ''
         return certPath ? { NODE_EXTRA_CA_CERTS: certPath } : {}
+      })(),
+      ...(() => {
+        const out = outFile?.trim() ?? ''
+        return out ? { ZR_DSH_MARKET_OUT: out } : {}
       })(),
     },
     stdio: 'ignore',
