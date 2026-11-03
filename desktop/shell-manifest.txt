@@ -89,3 +89,5 @@ apps/desktop/tests/fixtures/gateway-ca/server.pem
 apps/desktop/tests/gateway-trust.spec.ts
 apps/desktop/tests/model-gateway.spec.ts
 apps/desktop/tests/welcome-backend.spec.ts
+apps/desktop/renderer/assets/mom-logo.png
+apps/desktop/renderer/assets/mom-logo-256.png
