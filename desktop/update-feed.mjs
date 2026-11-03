@@ -121,14 +121,28 @@ function validateRemoteDir(remote) {
   return normalized
 }
 
+const KEEPALIVE = ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=8', '-o', 'TCPKeepAlive=yes']
+
 function sshOptions(key, port) {
   return ['-i', key, '-p', String(port), '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
-    '-o', 'ConnectTimeout=15']
+    '-o', 'ConnectTimeout=15', ...KEEPALIVE]
 }
 
 function scpOptions(key, port) {
   return ['-i', key, '-P', String(port), '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
-    '-o', 'ConnectTimeout=15']
+    '-o', 'ConnectTimeout=15', ...KEEPALIVE]
+}
+
+/** Long transfers over flaky links fail mid-stream; a retry restarts the whole copy. */
+function upload(scpArgs, source, target, label) {
+  const attempts = 3
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const result = spawnSync('scp', [...scpArgs, source, target], { stdio: 'inherit' })
+    if (result.error !== undefined) die(`${label} 无法启动: ${result.error.message}`)
+    if (result.status === 0) return
+    if (attempt === attempts) die(`${label} 失败（已尝试 ${attempts} 次）`)
+    log(`${label} 第 ${attempt} 次失败，重试`)
+  }
 }
 
 function prune(remote, platform, keep, sshArgs) {
@@ -215,8 +229,9 @@ async function main() {
   const scpArgs = [...scpOptions(key, port)]
 
   run('ssh', [...sshArgs, `mkdir -p '${remote}'`], '创建远端目录')
-  run('scp', [...scpArgs, artifact, `${user}@${host}:${remote}/${file}`], '上传安装包')
-  run('scp', [...scpArgs, feedPath, `${user}@${host}:${remote}/latest-${options.platform}.json`], '上传更新清单')
+  log(capture('ssh', [...sshArgs, `df -h '${remote}' | tail -n 1`], '读取远端磁盘').trim())
+  upload(scpArgs, artifact, `${user}@${host}:${remote}/${file}`, '上传安装包')
+  upload(scpArgs, feedPath, `${user}@${host}:${remote}/latest-${options.platform}.json`, '上传更新清单')
   prune(remote, options.platform, keep, sshArgs)
   await probe(options.feedBase, options.platform, sshArgs)
   log(`已发布 ${file}（${payload.version}）到 ${options.feedBase}`)
