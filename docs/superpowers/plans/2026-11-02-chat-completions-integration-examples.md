@@ -1,596 +1,326 @@
-# `/v1/chat/completions` 对接实例（按桌面端真实协议整理）
+# `/v1/chat/completions` 网关对接 —— 大白话版
 
-> 这份文档是 [2026-11-01-mom-server-integration-api.md](file:///Users/hebo/Desktop/中软项目/pythonProject_mom/docs/superpowers/plans/2026-11-01-mom-server-integration-api.md) 第 2.2 节的补充：给出**客户端实际会发出的请求**和**网关必须返回的响应**的完整实例。
->
-> 请求体不是手写的，是用桌面端同款协议实现（`@earendil-works/pi-ai` 1.1.0，`openai-completions`）实际生成并抓取的；工具定义取自桌面端真实注册的工具；响应示例也用该协议实现跑过解析，确认能还原出 `thinking` 和完整的 `tool_calls`。
+> **给谁看：** 公司后端同事，之前没做过模型网关也没关系
+> **这页只讲一个东西：** 客户端调你这个接口时，你到底要干哪几件事，哪几件事绝对不能干
+> **别慌：** 你不需要懂 AI，不需要懂 prompt engineering，不需要懂 token 怎么算。你只需要懂 HTTP 转发。
 
 ---
 
-## 先讲清楚链路：这些参数是谁、在什么时候产生的
+## 零、一句话先说清楚你要写的是什么
 
-先消除一个容易产生的误解：**下面的 `tools`、`system`、`messages` 不是服务端提前准备好的，也不是我事先“知道”用户会问什么。**
+**你写的不是聊天机器人，也不是 AI 算法服务。你写的就是一个"带鉴权和换包的快递中转站"。**
 
-这条链路上只有三个角色：
+客户端（工作助手桌面 app）把它要发给 DeepSeek 的请求先给你看一眼，你做 4 件事：
 
-1. **桌面端客户端**（Electron + Agent 运行时）——真正组装请求的一方。用户点发送的那一刻，它在本地把四样东西拼成一个 JSON：
-   - `system`：内置的系统提示词；
-   - `messages`：这次会话到目前为止的完整历史（用户消息、模型回复、工具结果）；
-   - `tools`：当前可用的工具清单（`grep`、`read`、`edit`、`write`、`bash`……），由客户端注册的工具生成；
-   - `model`：模型别名 `standard` / `deep`。
-2. **公司网关**（你的服务端）——只做四件事：鉴权、alias 映射、注入厂商 Key、原样转发。它不组装 messages，不定义工具，也不跑模型。
-3. **上游模型厂商**（DeepSeek）——真正做推理的一方。
+1. 检查客户端有没有登录（看 token）
+2. 把客户端说的"standard 模型"翻译成 DeepSeek 听得懂的"deepseek-chat"
+3. 把你手上的 DeepSeek API Key 塞进请求头
+4. 原封不动转发给 DeepSeek，然后 DeepSeek 吐什么你就给客户端吐什么
 
-时序是这样的：
+没了。就这 4 件事。**你不需要跑模型，不需要理解对话内容，不需要拼 prompt。**
 
-```text
-用户输入
-  → 客户端组装请求（system + 历史 + tools + alias）
-  → POST /v1/chat/completions 到网关
-  → 网关换 model、换 Authorization、原样转发
-  → 上游模型流式返回
-  → 客户端边收边渲染；模型要调工具时，客户端在本地执行
-  → 客户端把“工具调用 + 工具结果”追加进历史，再发第二轮
-  → …直到模型给出最终回答
+---
+
+## 一、为什么要搞这个中转站？为什么不让客户端直接调 DeepSeek？
+
+因为 DeepSeek 要收 Key。如果客户端直接调：
+- 每个用户的安装包里都要嵌一个 DeepSeek Key → 不安全，Key 泄露了没法吊销
+- 管理员管不了谁能用哪个模型、能用多少 → 用量统计也做不了
+- DeepSeek 涨价了/换供应商了 → 每个用户的 app 都要改
+
+中转站一搞：
+- Key 只在你服务器上，客户端碰都碰不到
+- 管理员在后台改一下"standard 映射到哪个模型"，所有用户下次请求自动生效
+- 每个用户每次调了多少 token，你在中转站随手就能记下来
+- 换供应商只改中转站，客户端一行代码不用改
+
+---
+
+## 二、整条链路长啥样
+
+```
+客户端 app（工作助手）
+  │
+  │  "我要调 standard 模型，这是我的 token，这是我要问的问题"
+  │
+  ▼
+你的中转站（就是你要写的 /v1/chat/completions）
+  │
+  │  ① token 对不对？→ 不对直接 401 打回去
+  │  ② standard → deepseek-chat（查你后台配的映射表）
+  │  ③ 塞 DeepSeek Key 进请求头
+  │  ④ 原封不动转发给 DeepSeek
+  │
+  ▼
+DeepSeek 官方 API（https://api.deepseek.com/v1/chat/completions）
+  │
+  │  开始推理，一个 token 一个 token 往外吐（SSE 流）
+  │
+  ▼
+你的中转站（边收边给客户端转，不缓存、不重组）
+  │
+  ▼
+客户端 app（一个字一个字蹦出来，打字机效果）
 ```
 
-所以：
+**重点理解两件事：**
 
-- **服务端不需要预先知道有哪些工具。** 它第一次看到工具清单，就是请求到达的时候；看到什么就转发什么。
-- **模型本身是无状态的。** 它之所以“记得”上一轮，是因为客户端每轮都把完整历史重新发了一遍。
-- **“不在服务器调用 LLM”指的是服务器不跑模型**，不是说客户端不经过服务器。示例里的 `POST /v1/chat/completions` 就是客户端发给网关的请求，网关再转给 DeepSeek。
+**1. DeepSeek 返回给谁？** 返回给你（中转站），中转站再转给客户端。
+客户端根本不知道 DeepSeek 的地址，也没有 DeepSeek 的 Key。客户端只知道你的中转站地址。DeepSeek 也不知道你的客户端存在，它只认你中转站给它的 Key。
 
-关于示例取材，避免误解：
-
-| 部分 | 来源 | 说明 |
-|------|------|------|
-| 请求字段结构（`stream_options`、`max_completion_tokens`、`content` 数组、`tool_calls` 形状） | 用项目同款协议库 pi-ai 1.1.0 实际生成/抓取 | 与真实客户端发出的结构一致 |
-| 工具定义（`grep`） | 取自桌面端真实注册的工具 | 名称、参数、描述都是项目里的原文 |
-| 对话内容、响应内容 | 示意 | 真实运行时由用户输入和上游模型决定 |
-
-换句话说：**示例的“格式”是真的，“剧情”是演示用的。**
+**2. 能不能让 DeepSeek 直接返回给客户端？** 不能。客户端没有 Key，DeepSeek 会拒接。而且 DeepSeek 的地址你也不想让客户端知道（万一被封了/换了，客户端不用改）。
 
 ---
 
-## 零、先看结论
+## 三、你要写的这个接口，收到的请求长啥样
 
-服务端同事实现 `/v1/chat/completions` 时，只要守住下面 8 条，Cursor 生成代码的常见问题都能避开：
+客户端会调：
 
-1. `model` 里是 **alias**（`standard` / `deep`），不是厂商真实模型名。
-2. **请求体的字段一律原样转发**，不要按自己的模型去反序列化再重新拼；客户端会发 `tools`、`stream_options`、`store`、`max_completion_tokens` 等你文档里没列的字段。
-3. `messages[].content` 可能是**数组**（`[{"type":"text","text":"..."}]`），也可能是字符串或 `null`；不要假设一定是字符串。
-4. 客户端**永远发 `stream: true`**；流式响应必须是 `text/event-stream`，**逐块 flush，不能先聚合再一次性返回**。
-5. `tool_calls` 在响应里是**分片**的：第一片带 `index/id/type/name`，后续片只带 `index/arguments` 片段；**不要累加后重组成一整条再发**。
-6. `reasoning_content`（深度思考内容）必须原样透传，不能丢。
-7. 上游错误必须在**开始推流之前**用 HTTP 状态码返回；一旦返回了 `200 text/event-stream`，就无法再改状态码。
-8. 厂商的 401（例如上游 Key 失效）**不能原样返回 401**，要映射成 502；否则客户端会误判为“用户登录过期”并踢用户下线。
+```
+POST https://你的服务器地址/v1/chat/completions
+Header: Authorization: Bearer <用户登录后的 token>
+Header: Content-Type: application/json
+```
+
+Body 长这样（简化版）：
+
+```json
+{
+  "model": "standard",
+  "messages": [
+    {"role": "system", "content": "你是江西中软工作助手"},
+    {"role": "user", "content": "帮我找一下配置文件"}
+  ],
+  "stream": true,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "grep",
+        "description": "搜文件内容",
+        "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}}
+      }
+    }
+  ],
+  "max_completion_tokens": 8192
+}
+```
+
+**你看到 `model: "standard"` 了吗？这个叫 alias（别名）。** 不是 DeepSeek 认识的模型名，是你们内部起的小名。
+
+DeepSeek 认识的模型名是 `deepseek-chat`（标准版）和 `deepseek-reasoner`（深度思考版）。
+以后可能换别的厂商，比如阿里千问，那 alias 还是 `standard`，但映射到的就是 `qwen-max` 了——这就是 alias 存在的意义：客户端永远说 standard，你决定 standard 到底是谁。
 
 ---
 
-## 一、请求实例 1：首轮对话（带工具定义）
+## 四、你要做的 4 件事，逐件讲
 
-### 1.1 请求行与请求头
+### 第 1 件：检查 token
 
-```http
-POST /v1/chat/completions HTTP/1.1
-Host: 175.178.238.31:8443
-Authorization: Bearer <登录接口返回的 token>
+请求头里有个 `Authorization: Bearer xxxxxxx`。这个 `xxxxxxx` 是用户登录时你（或你们的 auth 服务）发给他的。
+
+你要做的：拿着这个 token 去 auth 服务查一下，这个 token 有没有效、有没有过期、对应用户是谁、这个用户能用哪些模型。
+
+- token 无效/过期 → 直接返回 HTTP 401，body 随便写 `{"error": {"code": "session_expired", "message": "登录过期"}}`
+- token 有效 → 继续往下
+
+**这一步没通过，后面全部跳过。**
+
+### 第 2 件：alias → 真实模型名
+
+客户端给的 `model` 是 `standard`。你有一张映射表（存数据库里、存配置文件里都行）：
+
+| alias | 真实模型名 | 厂商 |
+|-------|-----------|------|
+| standard | deepseek-chat | DeepSeek |
+| deep | deepseek-reasoner | DeepSeek |
+
+查一下：`standard` → `deepseek-chat`。把 body 里的 `"model": "standard"` 改成 `"model": "deepseek-chat"`。
+
+如果 alias 不在映射表里，或者这个用户没被授权用这个 alias（比如他只用 standard 但请求了 deep），返回 HTTP 403。
+
+### 第 3 件：塞 DeepSeek Key
+
+你手上有一个 DeepSeek 官方给你的 API Key（比如 `sk-xxxxxxxxxxxxxxxx`）。这个 Key **只能在你服务器上出现**，绝对不能让客户端拿到。
+
+转发请求时，把请求头改成：
+
+```
+Authorization: Bearer sk-xxxxxxxxxxxxxxxx
 Content-Type: application/json
-Accept: application/json
+Accept: text/event-stream
 ```
 
-> 注意两点：
-> - `Accept` 是 `application/json`（OpenAI SDK 默认值），**不代表客户端不要流**。是否流式只看 body 里的 `"stream": true`，服务端不要根据 `Accept` 决定返回 JSON。
-> - 客户端还会带 `user-agent: pi (...)`、`x-stainless-*` 等头，全部可以忽略。
+就这一行换一下，原来客户端带的那个 token header 换成你的 DeepSeek Key。
 
-### 1.2 请求体（完整）
+### 第 4 件：原封不动转发 + 流式透传
 
-```json
-{
-  "model": "standard",
-  "messages": [
-    {
-      "role": "system",
-      "content": "你是江西中软工作助手，回答简洁准确。"
-    },
-    {
-      "role": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "帮我找一下模型网关的默认地址配置在哪个文件。"
-        }
-      ]
-    }
-  ],
-  "stream": true,
-  "stream_options": {
-    "include_usage": true
-  },
-  "store": false,
-  "max_completion_tokens": 8192,
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "grep",
-        "description": "Search file contents with a ripgrep regular expression. Returns matching lines with line numbers, grouped by file. Returns up to 250 matches; a larger result reports where the complete match list was saved.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "pattern": {
-              "type": "string",
-              "description": "Regular expression to search for (ripgrep syntax)."
-            },
-            "path": {
-              "type": "string",
-              "description": "File or directory to search. Defaults to the session workspace; a relative path resolves against it."
-            },
-            "include": {
-              "type": "string",
-              "description": "One glob filter for which files to search (e.g. \"*.ts\", \"*.{js,jsx}\"). Not a list; negation is not supported."
-            }
-          },
-          "required": [
-            "pattern"
-          ]
-        }
-      }
-    }
-  ]
-}
-```
+这是最关键的一件事，也是最容易被做错的一件事。
 
-> 真实的请求里，`system` 提示词和工具数量都远比这里多（工具清单通常有十几个），这里为了可读性只保留了最小集合。示例里的 `system` 文案只是占位，真实内容由客户端内置提示词和插件段落拼成，网关**不要解析或改写它**。除内容之外，**字段结构完全一致**。
+**转发请求：** 用你最熟悉的 HTTP 客户端库（Python 用 httpx，Java 用 OkHttp，Node 用 got），把第 2、3 步处理好的 body 和 headers 发到 `https://api.deepseek.com/v1/chat/completions`。
 
-### 1.3 网关应该怎么处理这个 body
+**流式透传：** DeepSeek 返回的不是一次性 JSON，是 SSE 流（Server-Sent Events）。它会一个 token 一个 token 往外吐，每个 token 就是一行 `data: {...}`。
 
-| 字段 | 客户端实际值 | 网关处理 |
-|------|--------------|----------|
-| `model` | `standard` | 查 alias 映射表，例如 `standard → deepseek-chat`，替换成真实模型名 |
-| `messages` | 数组，item 里 `content` 可能是字符串/数组/`null` | **原样转发**；不要统一改写成字符串 |
-| `stream` | 永远是 `true` | 按流式处理 |
-| `stream_options` | `{"include_usage": true}` | **保留**；上游不支持时再自行补一个 usage 事件（见第三节） |
-| `store` | `false` | OpenAI 专有字段；DeepSeek 不认时可以丢弃 |
-| `max_completion_tokens` | `8192` | DeepSeek 上游只认 `max_tokens`，建议改名为 `max_tokens` 再转发（见下方代码） |
-| `tools` | OpenAI function 工具定义 | **原样转发**，不要裁剪 |
-| `temperature`、`top_p` 等 | 有就带 | 原样转发 |
-| `tool_choice` | 有就带 | 原样转发 |
+**你要做的：** DeepSeek 吐一个 chunk → 你立刻转给客户端一个 chunk。**绝对不能等 DeepSeek 全吐完了你再一次性给客户端。** 那样用户看到的就是"卡 5 秒然后全出来"，而不是打字机效果。
 
-替换成上游请求时，建议做这几件事：
-
-```
-alias 映射          standard → deepseek-chat / deep → deepseek-reasoner
-max_completion_tokens → max_tokens    （DeepSeek 兼容）
-删掉 store、prompt_cache_key 等 OpenAI 专有字段（没有就跳过）
-强制 stream_options.include_usage = true
-Authorization 换成厂商 Key
-加一个 x-request-id 便于排查
-```
-
-**不要**动 `messages`、`tools`、`tool_choice`、`temperature`。
+而且你**绝对不能解析、重组、丢弃任何 chunk**。DeepSeek 发什么你就给客户端发什么。`tool_calls` 在 SSE 里是分片的（第一片带 id 和 name，后面几片只带参数片段），你如果把分片拼起来再发，客户端的工具调用就会坏。
 
 ---
 
-## 二、请求实例 2：工具结果回传（第二轮）
+## 五、DeepSeek 返回的 SSE 流长啥样
 
-客户端拿到工具调用结果后，会把“上一轮带 `tool_calls` 的 assistant 消息 + `role: "tool"` 的结果 + 新的用户消息”一起发回来。这是 Agent 场景最常见的第二轮请求。
+你不用知道每条 chunk 具体什么意思，只要原样转过去就行。这里给你看一眼大概长啥样，有个印象：
 
-```json
-{
-  "model": "standard",
-  "messages": [
-    {
-      "role": "system",
-      "content": "你是江西中软工作助手，回答简洁准确。"
-    },
-    {
-      "role": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "帮我找一下模型网关的默认地址配置在哪个文件。"
-        }
-      ]
-    },
-    {
-      "role": "assistant",
-      "content": null,
-      "tool_calls": [
-        {
-          "id": "call_00_abc",
-          "type": "function",
-          "function": {
-            "name": "grep",
-            "arguments": "{\"pattern\":\"DEFAULT_GATEWAY_BASE_URL\",\"include\":\"*.ts\"}"
-          }
-        }
-      ]
-    },
-    {
-      "role": "tool",
-      "content": "Found 1 match\n\ndesktop/shell/apps/desktop/src/model-gateway.ts\nLine 18: export const DEFAULT_GATEWAY_BASE_URL = 'https://175.178.238.31:8443'",
-      "tool_call_id": "call_00_abc"
-    },
-    {
-      "role": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "把那一行的内容贴出来。"
-        }
-      ]
-    }
-  ],
-  "stream": true,
-  "stream_options": {
-    "include_usage": true
-  },
-  "store": false,
-  "max_completion_tokens": 8192,
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "grep",
-        "description": "Search file contents with a ripgrep regular expression. Returns matching lines with line numbers, grouped by file. Returns up to 250 matches; a larger result reports where the complete match list was saved.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "pattern": {
-              "type": "string",
-              "description": "Regular expression to search for (ripgrep syntax)."
-            },
-            "path": {
-              "type": "string",
-              "description": "File or directory to search. Defaults to the session workspace; a relative path resolves against it."
-            },
-            "include": {
-              "type": "string",
-              "description": "One glob filter for which files to search (e.g. \"*.ts\", \"*.{js,jsx}\"). Not a list; negation is not supported."
-            }
-          },
-          "required": [
-            "pattern"
-          ]
-        }
-      }
-    }
-  ]
-}
 ```
+data: {"choices":[{"delta":{"reasoning_content":"用户想找配置文件，"},"finish_reason":null}]}
 
-第二轮有三个容易写错的点：
+data: {"choices":[{"delta":{"reasoning_content":"先搜一下 DEFAULT_GATEWAY"},"finish_reason":null}]}
 
-1. `assistant.content` 可以是 `null`，工具调用放在 `tool_calls` 里。
-2. `tool_calls[].function.arguments` 是**字符串**（JSON 序列化后的文本），不是对象。
-3. 工具结果消息是 `role: "tool"`，并且必须带 `tool_call_id` 指回调用 id；顺序必须是 `assistant(tool_calls) → tool → 下一条 user`，不能打乱。
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_001","type":"function","function":{"name":"grep","arguments":""}}]},"finish_reason":null}]}
 
----
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pattern\":"}}]},"finish_reason":null}]}
 
-## 三、流式响应实例（对应请求 1）
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"DEFAULT_GATEWAY\"}"}}]},"finish_reason":"tool_calls"}]}
 
-### 3.1 响应头
-
-```http
-HTTP/1.1 200 OK
-Content-Type: text/event-stream; charset=utf-8
-Cache-Control: no-cache, no-transform
-X-Accel-Buffering: no
-x-request-id: 6f1c0f2a9d8e4b7c9a1d2e3f4a5b6c7d
-```
-
-- 不要带 `Content-Length`，让传输层用 chunked。
-- 如果前面有 nginx，`X-Accel-Buffering: no` 必须加，否则 nginx 会缓冲，客户端看起来像“卡住很久然后一次性出结果”。
-
-### 3.2 完整的 SSE 响应体
-
-下面 8 个事件依次发出（每个事件之间是一个空行）：
-
-```text
-data: {"id":"chatcmpl-mom-1","object":"chat.completion.chunk","created":1762041600,"model":"deepseek-chat","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":"用户想定位模型网关默认地址，"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-mom-1","object":"chat.completion.chunk","created":1762041600,"model":"deepseek-chat","choices":[{"index":0,"delta":{"reasoning_content":"先在桌面端源码里搜常量名。"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-mom-1","object":"chat.completion.chunk","created":1762041600,"model":"deepseek-chat","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_00_abc","type":"function","function":{"name":"grep","arguments":""}}]},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-mom-1","object":"chat.completion.chunk","created":1762041600,"model":"deepseek-chat","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pattern\":"}}]},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-mom-1","object":"chat.completion.chunk","created":1762041600,"model":"deepseek-chat","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"DEFAULT_GATEWAY_BASE_URL\"}"}}]},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-mom-1","object":"chat.completion.chunk","created":1762041600,"model":"deepseek-chat","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
-
-data: {"id":"chatcmpl-mom-1","object":"chat.completion.chunk","created":1762041600,"model":"deepseek-chat","choices":[],"usage":{"prompt_tokens":1520,"completion_tokens":38,"total_tokens":1558}}
+data: {"choices":[],"usage":{"prompt_tokens":1520,"completion_tokens":38,"total_tokens":1558}}
 
 data: [DONE]
-
 ```
 
-### 3.3 逐个事件解释
-
-| # | 内容 | 作用 |
-|---|------|------|
-| 1 | `delta.role` + 第一段 `reasoning_content` | 告诉客户端这一轮是 assistant；`reasoning_content` 是“深度思考”内容，界面上折叠展示 |
-| 2 | 后续 `reasoning_content` | 思考内容继续追加 |
-| 3 | `tool_calls` 第一片：`index/id/type/name`，`arguments` 为空串 | 客户端据此创建工具调用占位 |
-| 4 | `arguments` 片段 `{"pattern":` | 参数按字符串分片到达 |
-| 5 | `arguments` 片段 `"DEFAULT_GATEWAY_BASE_URL"}` | 参数拼完；客户端拼起来后解析为 `{"pattern":"DEFAULT_GATEWAY_BASE_URL"}` |
-| 6 | `delta: {}` + `finish_reason: "tool_calls"` | 表示本轮以工具调用结束 |
-| 7 | `choices: []` + `usage` | token 用量；客户端靠这一条做统计 |
-| 8 | `data: [DONE]` | 流结束标记，必须发 |
-
-### 3.4 关键约束
-
-- 每个事件以 `data: ` 开头，以**两个换行**（`\n\n`）结束；不要少了空行。
-- `id`、`created`、`model` 在同一个响应的所有 chunk 里保持一致。
-- `tool_calls` 的 `index` 从 0 开始；同一轮有多个工具调用时，**每个 index 各自分片**。`id` 和 `name` 只在每个 index 的第一片出现。
-- `finish_reason` 只出现一次，取值是 `stop` / `tool_calls` / `length`。
-- `usage` 事件里的 `choices` 是空数组 `[]`，这是 OpenAI 规范；不要顺手填一条假 choice。
-- `[DONE]` 是纯文本，不是 JSON；不要写成 `data: {"done":true}`。
+**你只需要知道：**
+- 每一条以 `data: ` 开头，以一个空行结束
+- 最后一条是 `data: [DONE]`，表示流结束，必须原样转过去
+- `reasoning_content` 是深度思考内容，不能丢
+- `tool_calls` 是工具调用，分片到达的，不能拼
+- `usage` 是 token 用量，你可以自己解析了存数据库（做用量统计），但要先原样转给客户端
 
 ---
 
-## 四、流式响应实例（对应请求 2，最终回答）
+## 六、DeepSeek 报错怎么办
 
-工具执行完后，模型输出最终文本。响应结构相同，只是没有 `tool_calls`：
+**在流开始之前报错**（比如 Key 过期了、模型名不存在）：
+DeepSeek 会直接返回 401 / 404 / 429 这类 HTTP 状态码。你在自己这个中转站的 HTTP 响应里也返回错误。
 
-```text
-data: {"id":"chatcmpl-mom-2","object":"chat.completion.chunk","created":1762041604,"model":"deepseek-chat","choices":[{"index":0,"delta":{"role":"assistant","content":"默认地址在 "},"finish_reason":null}]}
+但注意：**DeepSeek 返回 401 时你绝对不能返回 401。** 客户端看到 401 会以为"自己登录过期了"，然后把用户踢下线。DeepSeek 的 401 是"你的 API Key 不行"，跟用户没关系，你应该返回 502。
 
-data: {"id":"chatcmpl-mom-2","object":"chat.completion.chunk","created":1762041604,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"`desktop/shell/apps/desktop/src/model-gateway.ts` "},"finish_reason":null}]}
+状态码对照表：
 
-data: {"id":"chatcmpl-mom-2","object":"chat.completion.chunk","created":1762041604,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"第 18 行：\n\n```ts\nexport const DEFAULT_GATEWAY_BASE_URL = 'https://175.178.238.31:8443'\n```"},"finish_reason":null}]}
+| DeepSeek 返回 | 你应该返回 | 含义 |
+|--------------|-----------|------|
+| 401 / 403 | 502 | 你的 API Key 有问题，服务端配置异常 |
+| 429 | 429 | 请求太频繁了，限流了 |
+| 500 / 502 | 502 | DeepSeek 那边炸了 |
+| 其他 4xx | 400 | 请求体有问题 |
 
-data: {"id":"chatcmpl-mom-2","object":"chat.completion.chunk","created":1762041604,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"\n\n未设置 `ZR_MODEL_GATEWAY_URL` 时，客户端就回退到这个地址。"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-mom-2","object":"chat.completion.chunk","created":1762041604,"model":"deepseek-chat","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
-
-data: {"id":"chatcmpl-mom-2","object":"chat.completion.chunk","created":1762041604,"model":"deepseek-chat","choices":[],"usage":{"prompt_tokens":1638,"completion_tokens":96,"total_tokens":1734}}
-
-data: [DONE]
-
-```
-
-> 这里为了可读性把回答拆成了 4 个 `content` 片段；真实上游怎么拆就怎么透传，**片段边界不影响客户端**，客户端会按顺序拼接。但**字段不能被改写**（例如不能把 `content` 拼成一条再发，也不能丢掉 `usage`）。
+**流已经开始之后报错**（比如 DeepSeek 中途断了）：
+你没法再改 HTTP 状态码了，直接断开连接就行，客户端会显示"响应中断"。
 
 ---
 
-## 五、非流式响应（只用于 curl 自测）
+## 七、服务端写代码的最小骨架（Python FastAPI 版）
 
-客户端正式请求永远是 `stream: true`，但服务端最好也支持 `stream: false`，方便你用 curl / Postman 排查。请求：
-
-```json
-{
-  "model": "standard",
-  "messages": [
-    { "role": "user", "content": "只回复 OK" }
-  ],
-  "stream": false
-}
-```
-
-响应 `200 application/json`：
-
-```json
-{
-  "id": "chatcmpl-mom-3",
-  "object": "chat.completion",
-  "created": 1762041608,
-  "model": "deepseek-chat",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "OK"
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 7,
-    "completion_tokens": 2,
-    "total_tokens": 9
-  }
-}
-```
-
-带工具调用时，非流式的 `message` 结构是：
-
-```json
-{
-  "role": "assistant",
-  "content": null,
-  "tool_calls": [
-    {
-      "id": "call_00_abc",
-      "type": "function",
-      "function": {
-        "name": "grep",
-        "arguments": "{\"pattern\":\"DEFAULT_GATEWAY_BASE_URL\",\"include\":\"*.ts\"}"
-      }
-    }
-  ]
-}
-```
-
----
-
-## 六、错误响应
-
-### 6.1 格式
-
-所有非 2xx 响应都用 JSON（不要用 SSE）：
-
-```json
-{
-  "error": {
-    "code": "model_not_allowed",
-    "message": "模型不在授权范围",
-    "type": "permission_error"
-  }
-}
-```
-
-`code` 用稳定英文枚举，`message` 给用户看。建议同时返回 `x-request-id`。
-
-### 6.2 状态码映射
-
-| 状态码 | 场景 | 客户端行为 | `code` 示例 |
-|--------|------|------------|-------------|
-| 401 | token 无效/过期 | 清会话，弹登录卡 | `session_expired` |
-| 403 | alias 不在该用户授权范围 | 提示无权限 | `model_not_allowed` |
-| 429 | 用户或全局限流 | 提示稍后重试 | `rate_limited` |
-| 400 | 请求体不合法 | 提示请求错误 | `invalid_body` |
-| 502 | 上游不可达 / 上游 5xx / **上游 401** | 提示模型服务异常 | `upstream_unavailable` |
-
-**重点：上游厂商返回 401（Key 失效）时必须映射为 502。** 如果原样回 401，客户端会认为用户登录过期并把用户踢下线。
-
-### 6.3 流已经开始后出错怎么办
-
-一旦已经返回 `200 text/event-stream` 并开始推 chunk，就**不能再改状态码**。此时只能：
-
-- 直接结束连接（客户端会显示“响应中断/模型服务异常”）；
-- 或者按 OpenAI 约定发一个错误事件（部分客户端支持）：
-
-```text
-data: {"error":{"code":"upstream_error","message":"模型服务中断"}}
-
-data: [DONE]
-
-```
-
-不要把错误 JSON 当成普通 chunk 混在正常内容里。
-
----
-
-## 七、参考实现（FastAPI + httpx）
-
-这段代码只做“鉴权 → alias 映射 → 字段兼容 → 注入 Key → 原样透传 SSE”，和现网网关的行为一致：
+这段代码就是完整的中转站了。把它读懂，改改鉴权那块的逻辑，就能跑起来：
 
 ```python
-import json
-import uuid
-
-import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-
-UPSTREAM = "https://api.deepseek.com/v1"
-UPSTREAM_KEY = "sk-..."                      # 只放服务端
-ALIASES = {"standard": "deepseek-chat", "deep": "deepseek-reasoner"}
+from fastapi.responses import StreamingResponse, JSONResponse
+import httpx
 
 app = FastAPI()
-client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
 
-
-def error(status: int, code: str, message: str, request_id: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status,
-        headers={"x-request-id": request_id},
-        content={"error": {"code": code, "message": message, "type": "api_error"}},
-    )
+# 你自己的配置 —— 以后放数据库里
+DEEPSEEK_KEY = "sk-xxxxxxxxxxxxxxxxxxxxx"   # DeepSeek 官方给你的 Key
+ALIAS_MAP = {
+    "standard": "deepseek-chat",
+    "deep": "deepseek-reasoner",
+}
+UPSTREAM_URL = "https://api.deepseek.com/v1/chat/completions"
+UPSTREAM = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
 
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
-    request_id = uuid.uuid4().hex
 
-    # 1. 鉴权：换成你自己的会话校验
+    # ========== 第 1 件：鉴权 ==========
     token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    user = verify_session(token)
-    if user is None:
-        return error(401, "session_expired", "登录已过期，请重新登录", request_id)
+    user = verify_user_token(token)   # ← 你们自己的鉴权函数
+    if not user:
+        return JSONResponse(status_code=401, content={"error": {"code": "session_expired", "message": "登录过期"}})
 
-    # 2. 读原始 body，不要反序列化成固定模型
-    try:
-        body = await request.json()
-    except Exception:
-        return error(400, "invalid_body", "请求体不是合法 JSON", request_id)
-    if not isinstance(body, dict):
-        return error(400, "invalid_body", "请求体必须是对象", request_id)
+    # ========== 读 body ==========
+    body = await request.json()
 
-    # 3. alias → 真实模型
-    alias = body.get("model")
-    real = ALIASES.get(alias) if isinstance(alias, str) else None
-    if real is None:
-        return error(403, "model_not_allowed", "模型不在授权范围", request_id)
+    # ========== 第 2 件：alias 映射 ==========
+    real_model = ALIAS_MAP.get(body["model"])
+    if not real_model:
+        return JSONResponse(status_code=403, content={"error": {"code": "model_not_allowed", "message": "这个模型没给你用"}})
 
-    # 4. 字段兼容：客户端的 max_completion_tokens 改成 DeepSeek 认的 max_tokens
-    payload = {**body, "model": real}
-    if "max_completion_tokens" in payload:
-        payload["max_tokens"] = payload.pop("max_completion_tokens")
-    payload.pop("store", None)
-    if payload.get("stream"):
-        options = payload.get("stream_options")
-        payload["stream_options"] = {
-            **(options if isinstance(options, dict) else {}),
-            "include_usage": True,
-        }
+    # 改 model 字段
+    body["model"] = real_model
+    body["max_tokens"] = body.pop("max_completion_tokens", 8192)  # DeepSeek 不认 max_completion_tokens
+    body.pop("store", None)  # OpenAI 专有字段，DeepSeek 不认，删了
 
-    # 5. 转发
-    upstream_request = client.build_request(
-        "POST",
-        f"{UPSTREAM}/chat/completions",
-        json=payload,
+    # ========== 第 3 件 + 第 4 件：转发 ==========
+    # 先拿个流式请求对象，但不真正发送
+    upstream_req = UPSTREAM.build_request(
+        "POST", UPSTREAM_URL,
+        json=body,
         headers={
-            "Authorization": f"Bearer {UPSTREAM_KEY}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream, application/json",
-            "Accept-Encoding": "identity",   # 保证 aiter_raw() 拿到的是明文 SSE
-            "x-request-id": request_id,
+            "Authorization": f"Bearer {DEEPSEEK_KEY}",
+            "Accept": "text/event-stream",
+            "Accept-Encoding": "identity",   # 关掉 gzip，保证 chunk 是明文 SSE
         },
     )
-    try:
-        upstream = await client.send(upstream_request, stream=True)
-    except httpx.HTTPError:
-        return error(502, "upstream_unavailable", "模型服务暂不可用，请稍后重试", request_id)
 
-    # 6. 上游错误必须在推流前返回；厂商 401 不能透传成 401
+    # 真正发送，stream=True 表示流式读取
+    upstream = await UPSTREAM.send(upstream_req, stream=True)
+
+    # ========== DeepSeek 在推流之前报错了 ==========
     if upstream.status_code >= 400:
-        await upstream.aread()
+        await upstream.aread()  # 把错误 body 读完再关
         await upstream.aclose()
         if upstream.status_code in (401, 403):
-            return error(502, "upstream_unavailable", "模型服务配置异常，请联系管理员", request_id)
-        if upstream.status_code == 429:
-            return error(429, "rate_limited", "请求过于频繁，请稍后重试", request_id)
-        return error(502, "upstream_error", "模型服务返回错误", request_id)
+            return JSONResponse(502, {"error": {"code": "upstream_auth_failed", "message": "模型服务配置异常"}})
+        return JSONResponse(502, {"error": {"code": "upstream_error", "message": "模型服务报错了"}})
 
-    # 7. 非流式：直接透传 JSON
-    if not payload.get("stream"):
-        raw = await upstream.aread()
-        await upstream.aclose()
-        return JSONResponse(content=json.loads(raw), headers={"x-request-id": request_id})
-
-    # 8. 流式：逐块透传，不解析、不重组
+    # ========== 第 4 件：流式透传 ==========
     async def relay():
-        try:
-            async for chunk in upstream.aiter_raw():
-                yield chunk
-        finally:
-            await upstream.aclose()
+        """DeepSeek 吐一个字节，我就给客户端吐一个字节。不解析、不重组。"""
+        async for chunk in upstream.aiter_raw():
+            yield chunk
+        await upstream.aclose()
 
     return StreamingResponse(
         relay(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            "x-request-id": request_id,
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # 如果前面有 nginx，必须加这个，否则 nginx 会缓冲
         },
     )
+
+
+def verify_user_token(token: str):
+    """你们自己的鉴权逻辑 —— 查数据库/Redis，返回用户信息或 None"""
+    # 伪代码：
+    # user = db.query("SELECT * FROM sessions WHERE token = ?", token)
+    # return user
+    pass
 ```
 
-> 如果要**在网关侧统计用量**：在 `relay()` 里把每个 chunk 追加到一个缓冲区，按行找 `data: ` 后 JSON 解析，遇到 `usage` 字段就记下来，流结束后落库。**透传给客户端的字节不要因此改变**。现网网关就是这么做的，并且用 `x-request-id` 做同一次调用的幂等键。
+**如果你用 Java / Node / Go，逻辑完全一样：**
+1. 读请求 → 查 token → 换 model → 换 Key → 流式转发 → 流式透传。没有别的。
 
 ---
 
-## 八、上线前自测
+## 八、用 curl 自测
 
-### 8.1 非流式（最快确认链路通）
+### 最快确认通不通（非流式）
 
 ```bash
-TOKEN='<登录拿到的 token>'
-curl -sS https://175.178.238.31:8443/v1/chat/completions \
+TOKEN="<用户登录拿到的 token>"
+
+curl -sS http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -600,83 +330,46 @@ curl -sS https://175.178.238.31:8443/v1/chat/completions \
   }'
 ```
 
-预期：`200`，JSON 里有 `choices[0].message.content == "OK"` 和 `usage`。
+预期：返回一个 JSON，里面有 `choices[0].message.content` 是 `"OK"`，有 `usage`。
 
-### 8.2 流式（确认是逐块返回，不是憋到最后）
+### 确认是流式不是憋大招
 
 ```bash
-TOKEN='<登录拿到的 token>'
-curl -N https://175.178.238.31:8443/v1/chat/completions \
+TOKEN="<用户登录拿到的 token>"
+
+curl -N http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -H "Accept: application/json" \
   -d '{
     "model": "standard",
-    "messages": [{"role": "user", "content": [{"type": "text", "text": "从 1 数到 20，每个数字单独一行"}]}],
-    "stream": true,
-    "stream_options": {"include_usage": true},
-    "store": false,
-    "max_completion_tokens": 1024
+    "messages": [{"role": "user", "content": "从 1 数到 20，每个数字单独一行"}],
+    "stream": true
   }'
 ```
 
-预期：
-
-- 终端里内容**陆续出现**，不是停几秒后整段出现；
-- 能看到多条 `data: {...}`；
-- 最后一条 `data: [DONE]`；
-- `usage` 事件在 `[DONE]` 之前。
-
-### 8.3 自带工具调用（确认分片没被重组坏）
-
-用 8.2 的 curl，但把 `tools` 换成文档第 1.2 节里的 `grep`，用户消息改成“帮我找一下模型网关的默认地址配置在哪个文件，用 grep 工具”。预期返回里出现 `tool_calls` 分片、`finish_reason: "tool_calls"`，客户端（或你的解析脚本）能拼出 `{"pattern":"DEFAULT_GATEWAY_BASE_URL"}`。
-
-### 8.4 验收清单
-
-- [ ] 首轮带 `tools` 的请求能正常返回工具调用
-- [ ] 第二轮带 `role: "tool"` 的请求能继续回答
-- [ ] `reasoning_content` 出现在 `deep` 模型响应里且没有被丢弃
-- [ ] `usage` 事件存在，数字能落库
-- [ ] `401 / 403 / 429 / 502` 按第六节映射
-- [ ] 上游 401 没有透传成客户端 401
-- [ ] nginx 没缓冲（内容逐块出现）
-- [ ] `[DONE]` 之后没有多余字节
+**`-N` 是关键！** 不加这个 curl 会缓冲。加上之后你应该看到数字一行一行蹦出来，不是停几秒后全出来。最后一条是 `data: [DONE]`。
 
 ---
 
-## 九、Cursor 生成代码最容易犯的错（对照检查）
+## 九、绝对不能做的 8 件事（做了客户端就坏）
 
-| 错误写法 | 后果 | 正确做法 |
-|----------|------|----------|
-| `resp = requests.post(..., json=body)` 然后 `return resp.json()` | 客户端要的是 SSE，收到 JSON 直接报错 | 用流式客户端（httpx `stream=True` / requests `stream=True`） |
-| 把整个 SSE 读完再 `yield` | 界面长时间无输出，像卡死 | 收到一块 yield 一块 |
-| 自己 `json.loads` 每个 chunk 再 `json.dumps` | 丢掉 `reasoning_content`、`tool_calls` 分片、未知字段 | 原样转发字节 |
-| 把 `tool_calls` 累加成完整一条再发 | 部分客户端解析不到工具调用 | 按上游分片透传 |
-| 不返回 `usage` chunk | 网关侧/客户端侧都无法统计 token | 保留 `stream_options.include_usage`，并透传 usage 事件 |
-| 把 `messages[].content` 强制转成字符串 | 多模态/多段文本结构被破坏 | 原样转发 |
-| 把 `max_completion_tokens` 原样发给 DeepSeek | 输出长度可能不受限 | 转成 `max_tokens` |
-| 忘了发 `[DONE]` | 客户端一直等，直到超时 | 最后补 `data: [DONE]\n\n` |
-| 流开始后返回 JSON 错误 | 客户端收到非法 chunk | 流开始前返回 HTTP 错误；流中直接断开 |
-| 上游 401 原样返回 | 用户被误踢下线 | 映射成 502 |
-| 网关开了 gzip / nginx 缓冲 | SSE 不实时 | `Accept-Encoding: identity`、`X-Accel-Buffering: no`、`proxy_buffering off` |
-| 用 `Accept` 判断是否流式 | 客户端 `Accept` 是 JSON，被误判成非流式 | 只看 body 的 `stream` 字段 |
+| # | 错误做法 | 后果 |
+|---|---------|------|
+| 1 | 把 DeepSeek 的请求体反序列化成你自己的 Python 模型再拼回去 | `messages[].content` 可能是数组不是字符串，你强制转字符串就坏了；`tools` 里可能有你不知道的字段被丢了 |
+| 2 | 等 DeepSeek 全返回完再 `yield` | 用户看 5 秒白屏然后全出来，没打字机效果 |
+| 3 | 把 `tool_calls` 分片拼起来再发 | 客户端解析不到工具调用，Agent 没法执行工具 |
+| 4 | 丢了 `reasoning_content` | 深度思考模型的思考过程看不到 |
+| 5 | 丢了 `usage` chunk | 你和客户端都没法统计 token 用量 |
+| 6 | 丢了最后的 `data: [DONE]` | 客户端一直等，直到超时 |
+| 7 | DeepSeek 401 你也返回 401 | 客户端把所有用户踢下线 |
+| 8 | nginx 开了 proxy_buffering | SSE 不实时，看起来像卡死 |
 
 ---
 
-## 附：字段对照速查
+## 十、跟之前那份详细文档的关系
 
-| 客户端发来的字段 | 类型 | 服务端要不要动 |
-|------------------|------|----------------|
-| `model` | string | 必须：alias → 真实模型名 |
-| `messages` | array | 不动 |
-| `messages[].content` | string / array / null | 不动 |
-| `stream` | bool | 不动（恒为 true） |
-| `stream_options.include_usage` | bool | 保留/强制 true |
-| `max_completion_tokens` | int | 建议改名为 `max_tokens` |
-| `store` | bool | 建议丢弃 |
-| `tools` | array | 不动 |
-| `tool_choice` | string/object | 不动 |
-| `temperature` / `top_p` | number | 不动 |
-| `tool_calls[].function.arguments` | string | 不动（响应里分片到达） |
-| `reasoning_content` | string | 不动（响应里透传） |
-| `usage` | object | 不动（同时可用于网关侧统计） |
+之前那份 682 行的文档是协议规范，包含了完整的字段表、SSE 每个 chunk 的逐字解释、错误码对照表、上线前 checklist、字段对照速查表。
+
+**这一份是"先跑起来再看"的入门版。** 你先用这份写个能转的中转，跑通了再去看那份详细版，对照着补边角（比如 `stream_options.include_usage` 强制开、`max_completion_tokens` 改 `max_tokens`、usage 解析存库、用量统计上报等）。
+
+**先让它工作起来，再让它完美起来。**
