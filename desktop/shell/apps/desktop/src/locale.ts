@@ -379,6 +379,15 @@ export function formatDesktopMessage(
 }
 
 /**
+ * User-facing form of an application or feed version. Packaged builds append the build date and
+ * sequence (`0.2.1-rc.2.20261102.2`); the display form keeps the release version and drops that
+ * suffix. Versions without it pass through unchanged.
+ */
+export function desktopDisplayVersion(version: string): string {
+  return version.replace(/\.\d{8}\.\d+$/u, '')
+}
+
+/**
  * Select localized copy for an ordinary downloaded-update confirmation.
  * @param messages - Selected Desktop dictionary.
  * @param version - Prepared update version, including any prerelease suffix.
@@ -392,7 +401,7 @@ export function desktopUpdateReadyConfirmation(
   manualMacInstall = false,
 ): { message: string; detail: string } {
   return {
-    message: formatDesktopMessage(messages.updateDownloadedTitle, { version }),
+    message: formatDesktopMessage(messages.updateDownloadedTitle, { version: desktopDisplayVersion(version) }),
     detail: platform === 'win32'
       ? messages.updateDownloadedDetailWindows
       : platform === 'darwin' && manualMacInstall

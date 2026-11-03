@@ -114,9 +114,15 @@ esac
 
 python3 "$DesktopRoot/prefetch-macos-runtime.py" "$BuildRoot" "$artifact_target"
 
+# 未签名 macOS 构建只认 --build-version 参数；环境变量会被打包进程回退成产品版本。
+# macOS 自带 bash 3.2：空数组 "${arr[@]}" 在 set -u 下会报 unbound variable，所以按条件分开调用。
 (
   cd "$BuildRoot"
-  corepack pnpm run "package:desktop:${script_target}:unsigned"
+  if [[ -n "${DSH_DESKTOP_BUILD_VERSION:-}" ]]; then
+    corepack pnpm run "package:desktop:${script_target}:unsigned" -- --build-version "$DSH_DESKTOP_BUILD_VERSION"
+  else
+    corepack pnpm run "package:desktop:${script_target}:unsigned"
+  fi
 )
 
 artifact_dir="$BuildRoot/apps/desktop/.desktop-build/targets/${artifact_target}/unsigned-artifacts"

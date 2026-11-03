@@ -10,9 +10,14 @@ $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'
 $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/'
 $env:ELECTRON_BUILDER_BINARIES_MIRROR = 'https://npmmirror.com/mirrors/electron-builder-binaries/'
 
+# 打包进程只认 --build-version 参数；环境变量会被回退成产品版本。
+$buildVersionArgs = @()
+if (-not [string]::IsNullOrWhiteSpace($env:DSH_DESKTOP_BUILD_VERSION)) {
+  $buildVersionArgs = @('--', '--build-version', $env:DSH_DESKTOP_BUILD_VERSION)
+}
 Push-Location $BuildRoot
 try {
-  & pnpm run package:desktop:win:x64:unsigned
+  & pnpm run package:desktop:win:x64:unsigned @buildVersionArgs
   if ($LASTEXITCODE -ne 0) { throw "official package failed with exit $LASTEXITCODE" }
 }
 finally {

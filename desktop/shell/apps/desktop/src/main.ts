@@ -31,7 +31,7 @@ import { installMicrophonePermissions } from './microphone-permissions.ts'
 import { DesktopBackendController } from './backend-controller.ts'
 import { DESKTOP_IPC, SCHEME, assertDesktopSender, type DesktopUpdateState } from './ipc.ts'
 import { readDeviceInfo } from './device-info.ts'
-import { desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLocale, resolveDesktopStartupLocale } from './locale.ts'
+import { desktopDisplayVersion, desktopUpdateReadyConfirmation, formatDesktopMessage, resolveDesktopLocale, resolveDesktopStartupLocale } from './locale.ts'
 import { claimDesktopSingleInstance } from './single-instance.ts'
 import { desktopUpdateChannel } from './update-channel.ts'
 import { DesktopUpdateCoordinator } from './update-coordinator.ts'
@@ -440,7 +440,7 @@ async function main(): Promise<void> {
   // chrome and its content never mix languages.
   const showAbout = async (): Promise<void> => {
     await ordinaryMessageBox({ type: 'info', title: locale.messages.aboutMenu, message: locale.messages.aboutProduct,
-      detail: formatDesktopMessage(locale.messages.aboutVersion, { version: app.getVersion() }),
+      detail: formatDesktopMessage(locale.messages.aboutVersion, { version: desktopDisplayVersion(app.getVersion()) }),
       buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
   }
   const commandManager = new DesktopCommandManager({
@@ -492,7 +492,21 @@ async function main(): Promise<void> {
       const timer = setInterval(() => { if (apply()) clearInterval(timer); }, 50);
       setTimeout(() => { clearInterval(timer); }, 120000);
     })()`
-    void Promise.resolve(execute.call(window.webContents, source)).catch(() => undefined)
+    // A cached-shell boot depends on this one injection; while the frame is still settling it can
+    // reject or hang once and leave the page on the pending origin forever. Retry until one lands.
+    const deadline = Date.now() + 120_000
+    let injected = false
+    const attempt = (): void => {
+      if (injected || quitting || shuttingDown || window.isDestroyed() || Date.now() >= deadline) return
+      let settled = false
+      const retry = setTimeout(() => { if (!settled) { settled = true; attempt() } }, 2_000)
+      retry.unref()
+      void Promise.resolve(execute.call(window.webContents, source)).then(
+        () => { injected = true; settled = true; clearTimeout(retry) },
+        () => { if (settled) return; settled = true; clearTimeout(retry); attempt() },
+      )
+    }
+    attempt()
   }
   let welcomeBackend: DesktopWelcomeBackend | undefined
   let reportedLaunch = false
@@ -1022,7 +1036,7 @@ async function main(): Promise<void> {
   })
   ipcMain.handle(DESKTOP_IPC.appVersion, (event) => {
     assertProductSender(event)
-    return app.getVersion()
+    return desktopDisplayVersion(app.getVersion())
   })
 
   let promptOperation: Promise<void> | undefined
@@ -1061,7 +1075,7 @@ async function main(): Promise<void> {
         if (state.phase === 'idle') {
           await ordinaryMessageBox({ type: 'info', title: locale.messages.updateCheckTitle,
             message: locale.messages.updateCurrent,
-            detail: formatDesktopMessage(locale.messages.updateCurrentDetail, { version: app.getVersion() }) })
+            detail: formatDesktopMessage(locale.messages.updateCurrentDetail, { version: desktopDisplayVersion(app.getVersion()) }) })
           return
         }
         if (state.phase === 'ready' || (state.phase === 'error' && state.failedOperation === 'install')) {
