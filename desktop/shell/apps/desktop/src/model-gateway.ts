@@ -6,16 +6,18 @@
  * so a build without a gateway keeps the local login and the official route.
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { normalizeEnterpriseKey } from './login-enterprises.ts'
+import { enterpriseCid, normalizeEnterpriseKey } from './login-enterprises.ts'
 import { SESSION_TTL_MS } from './local-login.ts'
 
 /**
  * Deployment address, used when `ZR_MODEL_GATEWAY_URL` is absent.
  * Set this in a build with a fixed gateway; leave empty to keep the feature off.
+ * The company server currently serves plain HTTP only (no TLS listener).
  */
-export const DEFAULT_GATEWAY_BASE_URL = 'https://175.178.238.31:8443'
+export const DEFAULT_GATEWAY_BASE_URL = 'http://113.90.149.166:11231'
 
 /** pi-ai route name requests select; also the prefix of every alias. */
 export const GATEWAY_PROVIDER = 'zr-gateway'
@@ -77,14 +79,50 @@ export type GatewayLoginOutcome =
 /** The narrow slice of `fetch` this module needs, so tests can supply a fake. */
 export type GatewayFetch = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal },
-) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>
+  init: { method: string; headers: Record<string, string>; body?: string; signal: AbortSignal },
+) => Promise<{ ok: boolean; status: number; headers: { get(name: string): string | null }; json(): Promise<unknown> }>
 
 const LOGIN_TIMEOUT_MS = 20_000
 
 /**
+ * Password the server expects: uppercase MD5 hex, characters 9–24, lowercased.
+ * @param plain - password typed on the card.
+ * @returns the 16-character digest sent as `Password`.
+ */
+export function gatewayLoginPassword(plain: string): string {
+  return createHash('md5').update(plain, 'utf8').digest('hex').toUpperCase().slice(8, 24).toLowerCase()
+}
+
+/**
+ * Read a .NET `TokenExpires` header (`yyyy-MM-ddTHH:mm:ss.fffffffZ`).
+ * @param raw - header value.
+ * @param now - current epoch milliseconds.
+ * @returns the epoch milliseconds, or undefined when absent, malformed, or not in the future.
+ */
+export function parseTokenExpires(raw: string | null, now: number): number | undefined {
+  const trimmed = raw?.trim() ?? ''
+  if (trimmed === '') return undefined
+  const parsed = Date.parse(trimmed.replace(/(\.\d{3})\d+/u, '$1'))
+  return Number.isFinite(parsed) && parsed > now ? parsed : undefined
+}
+
+function headerValue(headers: { get(name: string): string | null }, name: string): string | undefined {
+  const value = headers.get(name) ?? headers.get(name.toLowerCase())
+  return value === null ? undefined : value
+}
+
+/** Host envelope around every controller result; business outcome is `data`. */
+function readFunctionResult(payload: unknown): { Success?: unknown; Content?: unknown; Datas?: unknown } | undefined {
+  if (typeof payload !== 'object' || payload === null) return undefined
+  const data = (payload as Record<string, unknown>).data
+  if (typeof data !== 'object' || data === null) return undefined
+  return data as { Success?: unknown; Content?: unknown; Datas?: unknown }
+}
+
+/**
  * Accept only an origin that can carry a bearer token.
- * Plain HTTP is allowed for a loopback gateway in development and nowhere else.
+ * Plain HTTP is allowed for loopback development and for the build's own
+ * deployment host, which currently has no TLS listener.
  * @param raw - configured base URL.
  * @returns the normalized origin, or undefined when the value is unusable.
  */
@@ -95,10 +133,33 @@ export function parseGatewayBaseUrl(raw: string): string | undefined {
   } catch {
     return undefined
   }
-  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopbackHost(url.hostname))) return undefined
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && allowsPlainHttp(url.hostname))) return undefined
   if (url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') return undefined
   if (url.pathname !== '/' && url.pathname !== '') return undefined
   return url.origin
+}
+
+function redactUrl(raw: string): string {
+  try {
+    const url = new URL(raw)
+    url.username = ''
+    url.password = ''
+    url.search = ''
+    url.hash = ''
+    return url.toString()
+  } catch {
+    return '<unparseable>'
+  }
+}
+
+function allowsPlainHttp(hostname: string): boolean {
+  if (isLoopbackHost(hostname)) return true
+  try {
+    const deployment = new URL(DEFAULT_GATEWAY_BASE_URL)
+    return deployment.protocol === 'http:' && deployment.hostname === hostname
+  } catch {
+    return false
+  }
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -119,15 +180,21 @@ export function resolveGatewayConfig(
   if (raw === '') return undefined
   const baseUrl = parseGatewayBaseUrl(raw)
   if (baseUrl === undefined) {
-    console.error(`desktop model gateway: ignoring unusable base URL ${JSON.stringify(raw)}; HTTPS or a loopback HTTP origin is required`)
+    // The raw value may carry credentials in its userinfo; log only a redacted form.
+    console.error(`desktop model gateway: ignoring unusable base URL ${redactUrl(raw)}; HTTPS, a loopback HTTP origin, or the deployment host over HTTP is required`)
     return undefined
   }
   return { baseUrl, models: GATEWAY_MODELS }
 }
 
-/** Origin the OpenAI-compatible route targets: `{baseUrl}/v1`. */
+/**
+ * Origin the OpenAI-compatible route targets: `{baseUrl}/api/ai`.
+ * The colleague-server chat action (`/api/ai/Chat/Completions`) is
+ * OpenAI-compatible for streaming; the earlier self-built gateway's `/v1`
+ * route no longer exists on this backend.
+ */
 export function gatewayChatBaseUrl(config: GatewayConfig): string {
-  return `${config.baseUrl}/v1`
+  return `${config.baseUrl}/api/ai`
 }
 
 /**
@@ -151,12 +218,13 @@ export function gatewayPatchBlock(config: GatewayConfig): string {
     `        baseURL: ${gatewayChatBaseUrl(config)}`,
     '        api: openai-completions',
     `        apiKeyEnv: ${GATEWAY_CREDENTIAL_REF}`,
+    `        usageReportUrl: ${gatewayChatBaseUrl(config)}/Usage/Report`,
     '        compat:',
     '          thinkingFormat: deepseek',
     '        models:',
     ...config.models.flatMap(model => [
-      `          - id: ${model.id}`,
-      `            name: ${model.name}`,
+      `          - id: ${yamlScalar(model.id)}`,
+      `            name: ${yamlScalar(model.name)}`,
       `            contextWindow: ${model.contextWindow}`,
       `            maxTokens: ${model.maxTokens}`,
     ]),
@@ -165,9 +233,20 @@ export function gatewayPatchBlock(config: GatewayConfig): string {
     '- id: agent-default-model',
     '  config:',
     `    provider: ${GATEWAY_PROVIDER}`,
-    `    model: ${first?.id ?? ''}`,
+    `    model: ${yamlScalar(first?.id ?? '')}`,
     GATEWAY_PATCH_END,
   ].join('\n')
+}
+
+/**
+ * Quote a catalog-supplied scalar so a server value cannot alter the document.
+ * JSON string syntax is valid inside a YAML double-quoted scalar, and it
+ * escapes newlines, quotes, and control characters.
+ * @param value - alias or display name from the model catalog.
+ * @returns the quoted scalar.
+ */
+function yamlScalar(value: string): string {
+  return JSON.stringify(value)
 }
 
 /**
@@ -212,6 +291,8 @@ export function ensureGatewayProfile(profileDir: string, config: GatewayConfig):
 
 /**
  * Exchange the card's credentials for a session token.
+ * The token and its expiry arrive in response headers; the user object sits in
+ * the host envelope, and rejections still come back as HTTP 200 with `Content`.
  * @param config - resolved gateway.
  * @param input - enterprise, username, and password from the card.
  * @param options - fetch implementation, clock, and timeout for tests.
@@ -228,12 +309,18 @@ export async function loginWithGateway(
   if (password.length > 256) return { ok: false, code: 'invalid', detail: '用户名或密码错误' }
   const now = options.now ?? Date.now()
   const fetchImpl = options.fetch ?? defaultFetch
+  const body: Record<string, string> = {
+    UserName: username,
+    Password: gatewayLoginPassword(password),
+  }
+  const cid = enterpriseCid(input.enterpriseKey)
+  if (cid !== '') body.Enterprise = cid
   let response: Awaited<ReturnType<GatewayFetch>>
   try {
-    response = await fetchImpl(`${config.baseUrl}/api/login`, {
+    response = await fetchImpl(`${config.baseUrl}/api/sys/user/UserLogin`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify({ enterprise: normalizeEnterpriseKey(input.enterpriseKey), username, password }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(options.timeoutMs ?? LOGIN_TIMEOUT_MS),
     })
   } catch {
@@ -249,20 +336,21 @@ export async function loginWithGateway(
   } catch {
     return { ok: false, code: 'server', detail: '登录服务返回了无法识别的内容' }
   }
-  if (typeof payload !== 'object' || payload === null) {
-    return { ok: false, code: 'server', detail: '登录服务返回了无法识别的内容' }
+  const result = readFunctionResult(payload)
+  if (result === undefined) return { ok: false, code: 'server', detail: '登录服务返回了无法识别的内容' }
+  if (result.Success === false) {
+    const content = typeof result.Content === 'string' ? result.Content.trim() : ''
+    return { ok: false, code: 'invalid', detail: content === '' ? '用户名或密码错误' : content }
   }
-  const record = payload as Record<string, unknown>
-  const token = record.token
-  if (typeof token !== 'string' || !/^[\x21-\x7e]+$/u.test(token)) {
+  if (result.Success !== true) return { ok: false, code: 'server', detail: '登录服务返回了无法识别的内容' }
+  const token = headerValue(response.headers, 'Token')
+  if (token === undefined || !/^[\x21-\x7e]+$/u.test(token)) {
     return { ok: false, code: 'server', detail: '登录服务没有返回有效凭证' }
   }
-  const user = typeof record.user === 'object' && record.user !== null ? record.user as Record<string, unknown> : {}
-  const name = typeof user.name === 'string' && user.name.trim() !== '' ? user.name.trim() : username
-  const displayName = typeof user.displayName === 'string' && user.displayName.trim() !== '' ? user.displayName.trim() : name
-  const expiresAt = typeof record.expiresAt === 'number' && Number.isFinite(record.expiresAt) && record.expiresAt > now
-    ? record.expiresAt
-    : now + SESSION_TTL_MS
+  const user = typeof result.Datas === 'object' && result.Datas !== null ? result.Datas as Record<string, unknown> : {}
+  const name = typeof user.CUSER_NAME === 'string' && user.CUSER_NAME.trim() !== '' ? user.CUSER_NAME.trim() : username
+  const displayName = typeof user.CDISPLAY_NAME === 'string' && user.CDISPLAY_NAME.trim() !== '' ? user.CDISPLAY_NAME.trim() : name
+  const expiresAt = parseTokenExpires(headerValue(response.headers, 'TokenExpires') ?? null, now) ?? now + SESSION_TTL_MS
   return {
     ok: true,
     token,
@@ -274,3 +362,157 @@ export async function loginWithGateway(
 }
 
 const defaultFetch: GatewayFetch = (url, init) => fetch(url, init)
+
+const LOGOUT_TIMEOUT_MS = 5_000
+const MODELS_TIMEOUT_MS = 10_000
+
+/**
+ * The enabled-model catalog the gateway serves for the selector.
+ * `models` is ordered with `defaultAlias` first: the profile patch takes
+ * `models[0]` as the agent default model.
+ */
+export interface GatewayCatalog {
+  readonly models: GatewayModel[]
+  readonly defaultAlias: string
+}
+
+function parseCatalogModels(datas: Record<string, unknown>): GatewayModel[] | undefined {
+  if (!Array.isArray(datas.models)) return undefined
+  const models: GatewayModel[] = []
+  for (const item of datas.models) {
+    if (typeof item !== 'object' || item === null) continue
+    const row = item as Record<string, unknown>
+    const id = typeof row.alias === 'string' ? row.alias.trim() : ''
+    const name = typeof row.displayName === 'string' && row.displayName.trim() !== '' ? row.displayName.trim() : id
+    const contextWindow = Number(row.contextWindow)
+    const maxTokens = Number(row.maxTokens)
+    if (id === '' || !Number.isFinite(contextWindow) || contextWindow <= 0
+      || !Number.isFinite(maxTokens) || maxTokens <= 0) continue
+    models.push({ id, name, contextWindow, maxTokens })
+  }
+  return models.length === 0 ? undefined : models
+}
+
+/**
+ * Fetch the enabled-model catalog (`GET /api/ai/Models/Get`).
+ * Any failure resolves undefined so the caller keeps its built-in list.
+ * @param config - resolved gateway.
+ * @param token - session token from a successful login.
+ * @param options - fetch implementation and timeout for tests.
+ */
+export async function fetchGatewayModels(
+  config: GatewayConfig,
+  token: string,
+  options: { fetch?: GatewayFetch; timeoutMs?: number } = {},
+): Promise<GatewayCatalog | undefined> {
+  const trimmed = token.trim()
+  if (trimmed === '') return undefined
+  const fetchImpl = options.fetch ?? defaultFetch
+  let response: Awaited<ReturnType<GatewayFetch>>
+  try {
+    response = await fetchImpl(`${config.baseUrl}/api/ai/Models/Get`, {
+      method: 'GET',
+      // Fetch rejects any body on GET, so the catalog call must not send one.
+      headers: { authorization: `Bearer ${trimmed}`, accept: 'application/json' },
+      signal: AbortSignal.timeout(options.timeoutMs ?? MODELS_TIMEOUT_MS),
+    })
+  } catch {
+    return undefined
+  }
+  if (!response.ok) return undefined
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    return undefined
+  }
+  const result = readFunctionResult(payload)
+  if (result?.Success !== true || typeof result.Datas !== 'object' || result.Datas === null) return undefined
+  const datas = result.Datas as Record<string, unknown>
+  const models = parseCatalogModels(datas)
+  if (models === undefined) return undefined
+  const defaultAlias = typeof datas.defaultAlias === 'string' ? datas.defaultAlias.trim() : ''
+  const ordered = [...models].sort((a, b) => (b.id === defaultAlias ? 1 : 0) - (a.id === defaultAlias ? 1 : 0))
+  return { models: ordered, defaultAlias }
+}
+
+/**
+ * Read the cached catalog written after login; the patch is generated before
+ * the Host boots, when no token is available to refresh it.
+ * @param directory - `<userData>/gateway`.
+ * @returns the cached models, or undefined when absent or unreadable.
+ */
+export function readGatewayModelsCache(directory: string): GatewayModel[] | undefined {
+  try {
+    const raw: unknown = JSON.parse(readFileSync(join(directory, 'models.json'), 'utf8'))
+    if (typeof raw !== 'object' || raw === null) return undefined
+    const datas = (raw as Record<string, unknown>).models
+    if (!Array.isArray(datas)) return undefined
+    // The cache stores the normalized catalog ({id, name, ...}); parseCatalogModels
+    // validates the server row shape, so map back before reusing its checks.
+    const rows = datas.map((item) => {
+      if (typeof item !== 'object' || item === null) return item
+      const row = item as Record<string, unknown>
+      return { alias: row.id, displayName: row.name, contextWindow: row.contextWindow, maxTokens: row.maxTokens }
+    })
+    const models = parseCatalogModels({ models: rows })
+    return models
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Persist the freshly fetched catalog for the next startup's profile patch.
+ * A failed write only logs: the selector then keeps the built-in list.
+ * @param directory - `<userData>/gateway`.
+ * @param catalog - what {@link fetchGatewayModels} returned.
+ */
+export function writeGatewayModelsCache(directory: string, catalog: GatewayCatalog): void {
+  try {
+    if (!existsSync(directory)) mkdirSync(directory, { recursive: true })
+    writeFileSync(join(directory, 'models.json'), JSON.stringify({ version: 1, ...catalog }))
+  } catch (error) {
+    console.error('desktop model gateway catalog was not cached', error)
+  }
+}
+
+/**
+ * Best-effort server-side sign-out: invalidate the session token at the gateway.
+ * Every path resolves; a failure returns false and must never block the local
+ * sign-out that follows. A 401 means the session is already gone, which is the
+ * desired end state, so it counts as success.
+ * @param config - gateway the token was minted by.
+ * @param token - session token from a successful login.
+ * @param options - fetch implementation and timeout for tests.
+ * @returns whether the server session is known to be gone.
+ */
+export async function logoutWithGateway(
+  config: GatewayConfig,
+  token: string,
+  options: { fetch?: GatewayFetch } = {},
+): Promise<boolean> {
+  const trimmed = token.trim()
+  if (trimmed === '') return false
+  const fetchImpl = options.fetch ?? defaultFetch
+  let response: Awaited<ReturnType<GatewayFetch>>
+  try {
+    response = await fetchImpl(`${config.baseUrl}/api/sys/user/UserLogout`, {
+      method: 'POST',
+      // The host rejects a POST without a content type (415) and a truly
+      // empty body (400), although the document says "no request body".
+      headers: { authorization: `Bearer ${trimmed}`, 'content-type': 'application/json', accept: 'application/json' },
+      body: '{}',
+      signal: AbortSignal.timeout(LOGOUT_TIMEOUT_MS),
+    })
+  } catch {
+    return false
+  }
+  if (response.status === 401) return true
+  if (!response.ok) return false
+  try {
+    return readFunctionResult(await response.json())?.Success === true
+  } catch {
+    return false
+  }
+}

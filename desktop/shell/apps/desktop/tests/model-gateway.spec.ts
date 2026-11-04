@@ -6,10 +6,16 @@ import {
   GATEWAY_MODELS,
   applyGatewayPatch,
   ensureGatewayProfile,
+  fetchGatewayModels,
+  gatewayLoginPassword,
   gatewayPatchBlock,
   loginWithGateway,
+  logoutWithGateway,
   parseGatewayBaseUrl,
+  parseTokenExpires,
+  readGatewayModelsCache,
   resolveGatewayConfig,
+  writeGatewayModelsCache,
   type GatewayConfig,
   type GatewayFetch,
 } from '../src/model-gateway.ts'
@@ -41,25 +47,46 @@ interface Call {
   readonly init: Parameters<GatewayFetch>[1]
 }
 
-function respond(status: number, payload: unknown, calls: Call[] = []): GatewayFetch {
+function respond(
+  status: number,
+  payload: unknown,
+  calls: Call[] = [],
+  headers: Record<string, string> = {},
+): GatewayFetch {
+  const lowered = Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]))
   return async (url, init) => {
     calls.push({ url, init })
     return {
       ok: status >= 200 && status < 300,
       status,
+      headers: { get: (name: string) => lowered[name.toLowerCase()] ?? null },
       json: async () => payload,
     }
   }
 }
 
-it('accepts HTTPS origins and loopback HTTP only', () => {
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
+
+/** Host envelope the CI.Server wraps every controller result in. */
+function envelope(datas: unknown): unknown {
+  return { code: 200, success: true, data: { Success: true, Content: '', Datas: datas, TotalRows: 1 } }
+}
+
+/** Business rejection: HTTP 200, outer success true, reason in `Content`. */
+function rejection(content: string): unknown {
+  return { code: 200, success: true, data: { Success: false, Content: content, Datas: null, TotalRows: 0 } }
+}
+
+it('accepts HTTPS origins, loopback HTTP, and the deployment host over HTTP', () => {
   expect(parseGatewayBaseUrl('https://gateway.example')).toBe('https://gateway.example')
   expect(parseGatewayBaseUrl('https://gateway.example/')).toBe('https://gateway.example')
   expect(parseGatewayBaseUrl('https://gateway.example:8443')).toBe('https://gateway.example:8443')
   expect(parseGatewayBaseUrl('http://127.0.0.1:8787')).toBe('http://127.0.0.1:8787')
   expect(parseGatewayBaseUrl('http://localhost:8787')).toBe('http://localhost:8787')
   expect(parseGatewayBaseUrl('http://[::1]:8787')).toBe('http://[::1]:8787')
+  expect(parseGatewayBaseUrl('http://113.90.149.166:11231')).toBe('http://113.90.149.166:11231')
   expect(parseGatewayBaseUrl('http://gateway.example')).toBeUndefined()
+  expect(parseGatewayBaseUrl('http://192.168.1.10:11231')).toBeUndefined()
   expect(parseGatewayBaseUrl('https://gateway.example/v1')).toBeUndefined()
   expect(parseGatewayBaseUrl('https://user:secret@gateway.example')).toBeUndefined()
   expect(parseGatewayBaseUrl('https://gateway.example/?tenant=1')).toBeUndefined()
@@ -80,21 +107,45 @@ it('stays off without a URL and reads the environment first', () => {
   })
 })
 
+it('falls back to the company server when no URL is configured', () => {
+  expect(resolveGatewayConfig({})).toMatchObject({ baseUrl: 'http://113.90.149.166:11231' })
+})
+
 it('ignores an unusable URL instead of failing startup', () => {
   const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
   expect(resolveGatewayConfig({ ZR_MODEL_GATEWAY_URL: 'http://gateway.example' }, '')).toBeUndefined()
   expect(error).toHaveBeenCalledOnce()
 })
 
+it('does not log credentials embedded in an unusable URL', () => {
+  const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  expect(resolveGatewayConfig({ ZR_MODEL_GATEWAY_URL: 'https://user:secret@gateway.example' }, '')).toBeUndefined()
+  const logged = error.mock.calls.flat().join(' ')
+  expect(logged).not.toContain('secret')
+  expect(logged).not.toContain('user:')
+  error.mockRestore()
+})
+
 it('generates a block that registers the route and the default model', () => {
   const block = gatewayPatchBlock(config)
-  expect(block).toContain('baseURL: https://gateway.example/v1')
+  expect(block).toContain('baseURL: https://gateway.example/api/ai')
   expect(block).toContain('apiKeyEnv: ZR_GATEWAY_TOKEN')
+  expect(block).toContain('usageReportUrl: https://gateway.example/api/ai/Usage/Report')
   expect(block).toContain('provider: zr-gateway')
-  expect(block).toContain('model: standard')
-  expect(block).toContain('- id: standard\n            name: Flash')
-  expect(block).toContain('- id: deep\n            name: Pro')
+  expect(block).toContain('model: "standard"')
+  expect(block).toContain('- id: "standard"\n            name: "Flash"')
+  expect(block).toContain('- id: "deep"\n            name: "Pro"')
   expect(block).not.toContain('sk-')
+})
+
+it('quotes catalog values so they cannot alter the patch document', () => {
+  const block = gatewayPatchBlock({
+    baseUrl: 'https://gateway.example',
+    models: [{ id: 'evil\n- id: other', name: 'x: y # z', contextWindow: 1, maxTokens: 1 }],
+  })
+  expect(block).toContain('- id: "evil\\n- id: other"')
+  expect(block).toContain('name: "x: y # z"')
+  expect(block).not.toContain('\n- id: other')
 })
 
 it('disables the built-in DeepSeek provider it would otherwise compete with', () => {
@@ -109,9 +160,9 @@ it('labels the selector with the vendor model names the gateway fronts', () => {
     { id: 'deep', name: 'DeepSeek-V4-Pro', contextWindow: 128_000, maxTokens: 16_384 },
   ])
   const block = gatewayPatchBlock({ baseUrl: 'https://gateway.example', models: GATEWAY_MODELS })
-  expect(block).toContain('model: standard')
-  expect(block).toContain('name: DeepSeek-V4.1-Flash')
-  expect(block).toContain('name: DeepSeek-V4-Pro')
+  expect(block).toContain('model: "standard"')
+  expect(block).toContain('name: "DeepSeek-V4.1-Flash"')
+  expect(block).toContain('name: "DeepSeek-V4-Pro"')
 })
 
 it('fills an empty patch, keeps other rows, and re-runs without drift', () => {
@@ -132,8 +183,8 @@ it('replaces a previously written block when the gateway changes', () => {
   const first = applyGatewayPatch('[]\n', gatewayPatchBlock(config))
   const moved = gatewayPatchBlock({ ...config, baseUrl: 'https://other.example' })
   const second = applyGatewayPatch(first, moved)
-  expect(second).toContain('https://other.example/v1')
-  expect(second).not.toContain('https://gateway.example/v1')
+  expect(second).toContain('https://other.example/api/ai')
+  expect(second).not.toContain('https://gateway.example/api/ai')
   expect(second.match(/zr-model-gateway:begin/u)).toHaveLength(1)
 })
 
@@ -159,6 +210,19 @@ it('reports a write failure without throwing', () => {
   expect(error).toHaveBeenCalled()
 })
 
+it('hashes the password the way the server expects', () => {
+  expect(gatewayLoginPassword('secret')).toBe('ecd0e0f08eab7690')
+  expect(gatewayLoginPassword('admin123')).toBe('7bbd73250516f069')
+})
+
+it('parses .NET expiry headers and drops unusable values', () => {
+  expect(parseTokenExpires('2026-11-03T09:19:00.1234567Z', 1_000)).toBe(1_793_697_540_123)
+  expect(parseTokenExpires(' 2026-11-03T09:19:00Z ', 1_000)).toBe(Date.parse('2026-11-03T09:19:00Z'))
+  expect(parseTokenExpires('soon', 1_000)).toBeUndefined()
+  expect(parseTokenExpires('2026-11-03T09:19:00Z', Date.parse('2026-11-04T00:00:00Z'))).toBeUndefined()
+  expect(parseTokenExpires(null, 1_000)).toBeUndefined()
+})
+
 it('refuses empty or oversized credentials before any request', async () => {
   const fetchImpl = vi.fn<GatewayFetch>()
   expect(await loginWithGateway(config, { ...input, username: ' ' }, { fetch: fetchImpl })).toEqual({
@@ -170,41 +234,63 @@ it('refuses empty or oversized credentials before any request', async () => {
   expect(fetchImpl).not.toHaveBeenCalled()
 })
 
-it('exchanges credentials for a token', async () => {
+it('posts the transformed password to UserLogin and reads the token from headers', async () => {
   const calls: Call[] = []
   const outcome = await loginWithGateway(config, input, {
-    fetch: respond(200, { token: 'token-value', expiresAt: 2_000, user: { name: 'louis', displayName: '路易' } }, calls),
+    fetch: respond(200, envelope({ CUSER_NAME: 'louis', CDISPLAY_NAME: '路易' }), calls, {
+      Token: 'header-token',
+      TokenExpires: '2026-11-03T09:19:00.1234567Z',
+    }),
     now: 1_000,
   })
   expect(outcome).toEqual({
-    ok: true, token: 'token-value', expiresAt: 2_000, username: 'louis', displayName: '路易', enterpriseKey: 'jxzr',
+    ok: true,
+    token: 'header-token',
+    expiresAt: 1_793_697_540_123,
+    username: 'louis',
+    displayName: '路易',
+    enterpriseKey: 'jxzr',
   })
   expect(calls).toHaveLength(1)
   const [call] = calls
-  expect(call?.url).toBe('https://gateway.example/api/login')
+  expect(call?.url).toBe('https://gateway.example/api/sys/user/UserLogin')
   expect(call?.init.method).toBe('POST')
   expect(call?.init.headers['content-type']).toBe('application/json')
-  expect(JSON.parse(call?.init.body ?? '{}')).toEqual({ enterprise: 'jxzr', username: 'louis', password: 'secret' })
+  const body = JSON.parse(call?.init.body ?? '{}') as Record<string, string>
+  expect(body).toEqual({ UserName: 'louis', Password: 'ecd0e0f08eab7690' })
+  expect(JSON.stringify(body)).not.toContain('secret')
 })
 
 it('falls back to the account name and the standard lifetime', async () => {
   const viaName = await loginWithGateway(config, input, {
-    fetch: respond(200, { token: 'token-value', user: { name: 'louis' } }),
+    fetch: respond(200, envelope({ CUSER_NAME: 'louis' }), [], { Token: 'token-value' }),
     now: 1_000,
   })
-  expect(viaName).toMatchObject({ ok: true, displayName: 'louis', expiresAt: 1_000 + 7 * 24 * 60 * 60 * 1000 })
+  expect(viaName).toMatchObject({ ok: true, displayName: 'louis', expiresAt: 1_000 + SEVEN_DAYS_MS })
 
   const bare = await loginWithGateway(config, { ...input, enterpriseKey: 'unknown' }, {
-    fetch: respond(200, { token: 'token-value', expiresAt: 'soon' }),
+    fetch: respond(200, envelope({ CUSER_NAME: 'louis' }), [], { Token: 'token-value', TokenExpires: 'soon' }),
     now: 1_000,
   })
   expect(bare).toMatchObject({ ok: true, username: 'louis', displayName: 'louis', enterpriseKey: 'jxzr' })
 
   const stale = await loginWithGateway(config, input, {
-    fetch: respond(200, { token: 'token-value', expiresAt: 10 }),
-    now: 1_000,
+    fetch: respond(200, envelope({ CUSER_NAME: 'louis' }), [], { Token: 'token-value', TokenExpires: '2026-01-01T00:00:00Z' }),
+    now: Date.parse('2026-06-01T00:00:00Z'),
   })
-  expect(stale).toMatchObject({ ok: true, expiresAt: 1_000 + 7 * 24 * 60 * 60 * 1000 })
+  expect(stale).toMatchObject({ ok: true, expiresAt: Date.parse('2026-06-01T00:00:00Z') + SEVEN_DAYS_MS })
+})
+
+it('shows the server content when the credentials are rejected', async () => {
+  expect(await loginWithGateway(config, input, { fetch: respond(200, rejection('用户名或密码不正确!')) })).toEqual({
+    ok: false, code: 'invalid', detail: '用户名或密码不正确!',
+  })
+  expect(await loginWithGateway(config, input, { fetch: respond(200, rejection('用户名或密码不正确，请输入验证码')) })).toMatchObject({
+    ok: false, code: 'invalid', detail: '用户名或密码不正确，请输入验证码',
+  })
+  expect(await loginWithGateway(config, input, { fetch: respond(200, rejection('')) })).toMatchObject({
+    ok: false, code: 'invalid', detail: '用户名或密码错误',
+  })
 })
 
 it('maps gateway rejections to card copy', async () => {
@@ -221,11 +307,112 @@ it('never surfaces transport or payload details', async () => {
   })
 
   const brokenJson: GatewayFetch = async () => ({
-    ok: true, status: 200, json: async () => { throw new Error('unexpected token <') },
+    ok: true, status: 200, headers: { get: () => null }, json: async () => { throw new Error('unexpected token <') },
   })
   expect(await loginWithGateway(config, input, { fetch: brokenJson })).toMatchObject({ ok: false, code: 'server' })
 
   expect(await loginWithGateway(config, input, { fetch: respond(200, null) })).toMatchObject({ ok: false, code: 'server' })
-  expect(await loginWithGateway(config, input, { fetch: respond(200, { token: 42 }) })).toMatchObject({ ok: false, code: 'server' })
-  expect(await loginWithGateway(config, input, { fetch: respond(200, { token: 'has space' }) })).toMatchObject({ ok: false, code: 'server' })
+  expect(await loginWithGateway(config, input, { fetch: respond(200, { data: { Success: 'yes' } }) })).toMatchObject({ ok: false, code: 'server' })
+  expect(await loginWithGateway(config, input, { fetch: respond(200, envelope({ CUSER_NAME: 'louis' })) })).toMatchObject({ ok: false, code: 'server' })
+  expect(await loginWithGateway(config, input, {
+    fetch: respond(200, envelope({ CUSER_NAME: 'louis' }), [], { Token: 'has space' }),
+  })).toMatchObject({ ok: false, code: 'server' })
+})
+
+it('logs out with a bearer token and accepts the success envelope', async () => {
+  const calls: Call[] = []
+  const ok = await logoutWithGateway(config, ' session-tok ', { fetch: respond(200, { data: { Success: true, Content: '', Datas: null } }, calls) })
+  expect(ok).toBe(true)
+  expect(calls).toHaveLength(1)
+  expect(calls[0].url).toBe('https://gateway.example/api/sys/user/UserLogout')
+  expect(calls[0].init.method).toBe('POST')
+  expect(calls[0].init.headers.authorization).toBe('Bearer session-tok')
+  expect(calls[0].init.headers['content-type']).toBe('application/json')
+  expect(calls[0].init.body).toBe('{}')
+})
+
+it('treats an expired token as already signed out', async () => {
+  expect(await logoutWithGateway(config, 'tok', { fetch: respond(401, {}) })).toBe(true)
+})
+
+it('never throws: offline, server error, business rejection, and empty token all resolve false', async () => {
+  const offline: GatewayFetch = async () => { throw new Error('ECONNREFUSED') }
+  expect(await logoutWithGateway(config, 'tok', { fetch: offline })).toBe(false)
+  expect(await logoutWithGateway(config, 'tok', { fetch: respond(500, {}) })).toBe(false)
+  expect(await logoutWithGateway(config, 'tok', { fetch: respond(200, rejection('退出失败：请携带当前登录 Token')) })).toBe(false)
+
+  let called = false
+  const unused: GatewayFetch = async () => { called = true; throw new Error('must not be called') }
+  expect(await logoutWithGateway(config, '   ', { fetch: unused })).toBe(false)
+  expect(called).toBe(false)
+})
+
+const catalogDatas = (models: unknown[], defaultAlias = 'standard') => ({
+  data: { Success: true, Content: '', Datas: { models, defaultAlias } },
+})
+
+it('fetches the model catalog and puts the default alias first', async () => {
+  const calls: Call[] = []
+  const catalog = await fetchGatewayModels(config, ' tok ', {
+    fetch: respond(200, catalogDatas([
+      { alias: 'standard', displayName: 'Flash', contextWindow: 128000, maxTokens: 8192 },
+      { alias: 'deep', displayName: 'Pro', contextWindow: 64000, maxTokens: 16384 },
+    ]), calls),
+  })
+  expect(catalog?.defaultAlias).toBe('standard')
+  expect(catalog?.models.map(model => model.id)).toEqual(['standard', 'deep'])
+  expect(catalog?.models[0]).toEqual({ id: 'standard', name: 'Flash', contextWindow: 128000, maxTokens: 8192 })
+  expect(calls).toHaveLength(1)
+  expect(calls[0].url).toBe('https://gateway.example/api/ai/Models/Get')
+  expect(calls[0].init.method).toBe('GET')
+  expect(calls[0].init.headers.authorization).toBe('Bearer tok')
+  expect(calls[0].init.body).toBeUndefined()
+
+  const reordered = await fetchGatewayModels(config, 'tok', {
+    fetch: respond(200, catalogDatas([
+      { alias: 'standard', displayName: 'Flash', contextWindow: 128000, maxTokens: 8192 },
+      { alias: 'deep', displayName: 'Pro', contextWindow: 64000, maxTokens: 16384 },
+    ], 'deep')),
+  })
+  expect(reordered?.models.map(model => model.id)).toEqual(['deep', 'standard'])
+})
+
+it('drops invalid catalog rows and resolves undefined on any failure', async () => {
+  const sparse = await fetchGatewayModels(config, 'tok', {
+    fetch: respond(200, catalogDatas([
+      { alias: 'ok', displayName: 'Fine', contextWindow: 1000, maxTokens: 100 },
+      { alias: '', displayName: 'No id', contextWindow: 1000, maxTokens: 100 },
+      { alias: 'bad-window', displayName: 'X', contextWindow: 0, maxTokens: 100 },
+      { alias: 'no-name', contextWindow: 1000, maxTokens: 100 },
+      'garbage',
+    ])),
+  })
+  expect(sparse?.models).toEqual([{ id: 'ok', name: 'Fine', contextWindow: 1000, maxTokens: 100 }, { id: 'no-name', name: 'no-name', contextWindow: 1000, maxTokens: 100 }])
+
+  const offline: GatewayFetch = async () => { throw new Error('ECONNREFUSED') }
+  expect(await fetchGatewayModels(config, 'tok', { fetch: offline })).toBeUndefined()
+  expect(await fetchGatewayModels(config, 'tok', { fetch: respond(401, {}) })).toBeUndefined()
+  expect(await fetchGatewayModels(config, 'tok', { fetch: respond(500, {}) })).toBeUndefined()
+  expect(await fetchGatewayModels(config, 'tok', { fetch: respond(200, rejection('当前登录用户无效')) })).toBeUndefined()
+  expect(await fetchGatewayModels(config, 'tok', { fetch: respond(200, { data: { Success: true, Datas: { models: [] } } }) })).toBeUndefined()
+
+  let called = false
+  const unused: GatewayFetch = async () => { called = true; throw new Error('must not be called') }
+  expect(await fetchGatewayModels(config, '  ', { fetch: unused })).toBeUndefined()
+  expect(called).toBe(false)
+})
+
+it('round-trips the catalog through the cache and tolerates a broken one', async () => {
+  const dir = directory()
+  expect(readGatewayModelsCache(dir)).toBeUndefined()
+  writeGatewayModelsCache(dir, {
+    models: [{ id: 'deep', name: 'Pro', contextWindow: 64000, maxTokens: 16384 }],
+    defaultAlias: 'deep',
+  })
+  expect(readGatewayModelsCache(dir)).toEqual([{ id: 'deep', name: 'Pro', contextWindow: 64000, maxTokens: 16384 }])
+
+  writeFileSync(join(dir, 'models.json'), '{not json')
+  expect(readGatewayModelsCache(dir)).toBeUndefined()
+  writeFileSync(join(dir, 'models.json'), JSON.stringify({ version: 1, models: [{ alias: 'x' }] }))
+  expect(readGatewayModelsCache(dir)).toBeUndefined()
 })

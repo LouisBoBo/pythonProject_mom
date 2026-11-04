@@ -59,7 +59,7 @@ import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashRep
 import { mountWelcomeView, type WelcomeSurface } from './welcome-window.ts'
 import { WELCOME_IPC, needsWelcome, type WelcomeLoginInput, type WelcomeNotice } from './welcome-api.ts'
 import { clearLocalSession, localLoginDirectory, loginInitialized, readValidSession, recordGatewaySession, submitLocalLogin } from './local-login.ts'
-import { resolveGatewayConfig, ensureGatewayProfile, loginWithGateway, GATEWAY_CREDENTIAL_REF } from './model-gateway.ts'
+import { resolveGatewayConfig, ensureGatewayProfile, loginWithGateway, logoutWithGateway, fetchGatewayModels, readGatewayModelsCache, writeGatewayModelsCache, GATEWAY_CREDENTIAL_REF } from './model-gateway.ts'
 import { trustGatewayCa, writeGatewayCaFile } from './gateway-trust.ts'
 import { connectDesktopWelcome, type DesktopWelcomeBackend } from './welcome-backend.ts'
 import { DesktopUpdateJournal } from './update-journal.ts'
@@ -384,11 +384,15 @@ async function main(): Promise<void> {
     return result.environment
   })
   let hostEnvironment: NodeJS.ProcessEnv = process.env
+  const gatewayModelsDirectory = join(app.getPath('userData'), 'gateway')
   const prepareHostEnvironment = async (): Promise<void> => {
     hostEnvironment = await loginShell
     if (gateway === undefined) return
-    ensureGatewayProfile(paths.profile, gateway)
-    const bundle = writeGatewayCaFile(join(app.getPath('userData'), 'gateway'), hostEnvironment.NODE_EXTRA_CA_CERTS)
+    // The catalog can only refresh after a login, so startup uses the cache
+    // from the last one; the built-in list covers a fresh or broken cache.
+    const cachedModels = readGatewayModelsCache(gatewayModelsDirectory)
+    ensureGatewayProfile(paths.profile, cachedModels === undefined ? gateway : { ...gateway, models: cachedModels })
+    const bundle = writeGatewayCaFile(gatewayModelsDirectory, hostEnvironment.NODE_EXTRA_CA_CERTS)
     if (bundle !== undefined) hostEnvironment = { ...hostEnvironment, NODE_EXTRA_CA_CERTS: bundle }
   }
   let quitting = false
@@ -758,6 +762,13 @@ async function main(): Promise<void> {
     if (gateway === undefined || welcomeBackend === undefined) return true
     return welcomeBackend.read().then(state => state.hasApiKey).catch(() => true)
   }
+  /**
+   * The token minted by this process's last gateway login, kept in memory so
+   * sign-out can call the gateway's logout endpoint. The Host credential store
+   * has no read-back RPC, so after a restart (session remembered, no fresh
+   * login) the value is absent and sign-out falls back to local-only cleanup.
+   */
+  let gatewaySessionToken: string | undefined
   stopForRecovery = () => backend.close()
 
   const reconcileBackend = (): Promise<void> => {
@@ -1446,7 +1457,17 @@ async function main(): Promise<void> {
             return { ok: false, code: 'server', detail: '登录服务暂时不可用，请稍后再试' }
           }
           if (!(await welcomeBackend.save(outcome.token)).ok) {
+            // The credential store refused the token, so this session can never
+            // be used here; end it server-side instead of leaving it orphaned.
+            await logoutWithGateway(gateway, outcome.token)
             return { ok: false, code: 'server', detail: '凭证未保存，请重试' }
+          }
+          gatewaySessionToken = outcome.token
+          const catalog = await fetchGatewayModels(gateway, outcome.token).catch(() => undefined)
+          if (catalog === undefined) {
+            console.warn('desktop model gateway: model catalog unavailable, keeping the built-in model list')
+          } else {
+            writeGatewayModelsCache(gatewayModelsDirectory, catalog)
           }
           recordGatewaySession(desktopLoginDirectory(), {
             username: outcome.username,
@@ -1540,7 +1561,12 @@ async function main(): Promise<void> {
   })
   ipcMain.handle(DESKTOP_IPC.localSignOut, async (event) => {
     assertProductSender(event)
+    const sessionToken = gatewaySessionToken
     clearLocalSession(desktopLoginDirectory())
+    gatewaySessionToken = undefined
+    if (gateway !== undefined && sessionToken !== undefined) {
+      await logoutWithGateway(gateway, sessionToken).catch(() => false)
+    }
     if (gateway !== undefined) await welcomeBackend?.clear()
     enteredWorkspace = false
     publishLocalUser()

@@ -381,11 +381,14 @@ export function formatDesktopMessage(
 /**
  * User-facing form of an application or feed version. Packaged builds append the build date and
  * sequence (`0.2.1-rc.2.20261102.2`) and carry a prerelease segment (`-rc.2`) that means nothing
- * to end users; the display form keeps only the release numbers (`0.2.1`). Versions without a
- * leading semver core pass through unchanged.
+ * to end users. The display form keeps the release numbers plus the build stamp, so builds of the
+ * same release stay distinguishable (`0.2.1 (20261102.2)`). Versions without that suffix pass
+ * through unchanged.
  */
 export function desktopDisplayVersion(version: string): string {
-  return /^(\d+\.\d+\.\d+)/u.exec(version)?.[1] ?? version
+  const parsed = /^(\d+\.\d+\.\d+)(?:-[0-9A-Za-z.-]+?)?\.(\d{8})\.(\d+)$/u.exec(version)
+  if (parsed === null) return version
+  return `${parsed[1]} (${parsed[2]}.${parsed[3]})`
 }
 
 /**

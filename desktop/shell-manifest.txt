@@ -91,3 +91,11 @@ apps/desktop/tests/model-gateway.spec.ts
 apps/desktop/tests/welcome-backend.spec.ts
 apps/desktop/renderer/assets/mom-logo.png
 apps/desktop/renderer/assets/mom-logo-256.png
+packages/llm/llm-pi-ai/src/stream-guard.ts
+packages/llm/llm-pi-ai/src/models.ts
+packages/llm/llm-pi-ai/src/config.ts
+packages/llm/llm-pi-ai/src/adapter.ts
+packages/llm/llm-pi-ai/src/usage-report.ts
+packages/llm/llm-pi-ai/tests/stream-guard.spec.ts
+packages/llm/llm-pi-ai/tests/usage-report.spec.ts
+packages/llm/llm-pi-ai/tests/usage-report-adapter.spec.ts
