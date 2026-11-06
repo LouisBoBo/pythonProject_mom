@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -7,6 +7,7 @@ import {
   desktopBootCanContinue,
   desktopShellSnapshot,
   desktopShellSnapshotPath,
+  isShellCacheFileName,
   pluginScriptRevisions,
   readDesktopShellSnapshot,
   rewriteStalePluginRevision,
@@ -56,6 +57,41 @@ describe('desktop shell snapshot', () => {
     expect(restored?.read('/plugins/??app/client.js&rev=abc')).toBe('console.log(1)')
     expect(readDesktopShellSnapshot(directory, '0.2.1-rc.1')).toBeUndefined()
     expect(desktopShellSnapshotPath(directory)).toContain('desktop-shell')
+  })
+
+  it('stores scripts by content hash and drops orphan files on rewrite', () => {
+    const directory = home()
+    const first = desktopShellSnapshot('0.2.1-rc.2', [], {
+      '/plugins/??app/client.js&rev=old': 'console.log(1)',
+    })
+    writeDesktopShellSnapshot(directory, first)
+    const shellDir = desktopShellSnapshotPath(directory)
+    writeFileSync(join(shellDir, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.js'), 'stale')
+    const second = desktopShellSnapshot('0.2.1-rc.2', [], {
+      '/plugins/??app/client.js&rev=new': 'console.log(1)',
+      '/plugins/??layout/client.js&rev=new': 'console.log(2)',
+    })
+    writeDesktopShellSnapshot(directory, second)
+    const restored = readDesktopShellSnapshot(directory, '0.2.1-rc.2')
+    expect(restored?.read('/plugins/??app/client.js&rev=new')).toBe('console.log(1)')
+    expect(restored?.read('/plugins/??layout/client.js&rev=new')).toBe('console.log(2)')
+    expect(existsSync(join(shellDir, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.js'))).toBe(false)
+  })
+
+  it('rejects a tampered index that points outside the cache directory', () => {
+    expect(isShellCacheFileName('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.js')).toBe(true)
+    expect(isShellCacheFileName('../secrets.txt')).toBe(false)
+    const directory = home()
+    const shellDir = desktopShellSnapshotPath(directory)
+    writeDesktopShellSnapshot(directory, desktopShellSnapshot('0.2.1-rc.2', [], {
+      '/plugins/??app/client.js&rev=abc': 'console.log(1)',
+    }))
+    writeFileSync(join(shellDir, 'index.json'), JSON.stringify({
+      version: '0.2.1-rc.2',
+      injections: [],
+      files: { '/plugins/??app/client.js&rev=abc': '../../../etc/passwd' },
+    }))
+    expect(readDesktopShellSnapshot(directory, '0.2.1-rc.2')).toBeUndefined()
   })
 
   it('serves a cached script and refuses a request the snapshot does not name', () => {

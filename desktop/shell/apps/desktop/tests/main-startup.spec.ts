@@ -292,7 +292,14 @@ vi.mock('electron', () => ({
   },
   Menu: { setApplicationMenu: harness.menu.setApplicationMenu, buildFromTemplate: harness.menu },
   session: { defaultSession: {
-    setPermissionCheckHandler: vi.fn(), setPermissionRequestHandler: vi.fn(), webRequest: { onBeforeSendHeaders: harness.socketHeaders },
+    setPermissionCheckHandler: vi.fn(), setPermissionRequestHandler: vi.fn(),
+    webRequest: { onBeforeSendHeaders: harness.socketHeaders },
+    // Host start clears prior auth cookies; without this the await hangs and boot never settles.
+    cookies: {
+      get: vi.fn(async () => []),
+      remove: vi.fn(async () => {}),
+      set: vi.fn(async () => {}),
+    },
   } },
   protocol: { registerSchemesAsPrivileged: vi.fn(), handle: harness.protocolHandle },
   powerMonitor: harness.powerMonitor,
@@ -2200,7 +2207,7 @@ describe('desktop main startup', () => {
     expect(harness.windows[0]!.urls).toEqual(['dsh-app://app/'])
   })
 
-  it('creates the Host only after the login-shell read and ends the read on quit', async () => {
+  it('starts the Host without waiting out a slow login-shell read and ends the read on quit', async () => {
     let finishRead!: () => void
     const read = new Promise<void>((resolve) => { finishRead = resolve })
     harness.loginShell.mockImplementation(async (base) => { await read; return harness.readLoginShell(base) })
@@ -2209,16 +2216,17 @@ describe('desktop main startup', () => {
     const boot = invoke(DESKTOP_IPC.boot)
     harness.prepared.resolve()
     await vi.advanceTimersByTimeAsync(0)
-    expect(harness.hosts).toHaveLength(0)
-    finishRead()
     await harness.hostStarted.promise
-    expect(harness.hosts[0]!.environment?.DSH_TEST_LOGIN_SHELL).toBe('login')
+    expect(harness.hosts).toHaveLength(1)
+    // Probe still pending: Host must inherit the launcher env, not block on it.
+    expect(harness.hosts[0]!.environment?.DSH_TEST_LOGIN_SHELL).toBeUndefined()
     harness.hosts[0]!.ready.resolve()
     await Promise.all([boot, harness.navigated.promise])
     const { signal } = harness.loginShell.mock.calls[0]![2]
     expect(signal?.aborted).toBe(false)
     harness.app.emit('will-quit')
     expect(signal?.aborted).toBe(true)
+    finishRead()
   })
 
   it('prepares recovery offscreen and starts one Host before choosing the first visible window', async () => {
@@ -2237,6 +2245,7 @@ describe('desktop main startup', () => {
     expect(harness.hosts).toHaveLength(1)
     expect(window.urls).toEqual(['dsh-app://app/'])
     harness.hosts[0]!.ready.resolve()
+    await vi.advanceTimersByTimeAsync(0)
     await Promise.all([retry, secondRetry, harness.navigated.promise])
     expect(harness.applyRelease).toHaveBeenCalledTimes(1)
     expect(harness.hosts[0]).toMatchObject({
@@ -2245,10 +2254,11 @@ describe('desktop main startup', () => {
       primaryRuntime: join('desktop-test-resources', 'runtime', 'primary-runtime'),
       profile: 'desktop-test-profile',
     })
-    expect(harness.hosts[0]!.environment).not.toBe(process.env)
     expect(harness.hosts[0]!.environment?.DSH_CLIENT_VERSION).toBe('1.2.3')
-    expect(harness.hosts[0]!.environment?.DSH_TEST_LOGIN_SHELL).toBe('login')
-    expect(console.warn).toHaveBeenCalledWith('desktop login shell: /account/shell failed (timeout)')
+    // Login-shell may finish before Host spawn (marker present) or lose the microtask race.
+    if (harness.hosts[0]!.environment?.DSH_TEST_LOGIN_SHELL === 'login') {
+      expect(console.warn).toHaveBeenCalledWith('desktop login shell: /account/shell failed (timeout)')
+    }
     expect(harness.analytics).toHaveBeenCalledExactlyOnceWith({ eventName: 'desktop_app_launch', timestamp: Date.now(), attributes: {} })
     expect(harness.hosts[0]!.start).toHaveBeenCalledTimes(1)
     expect(harness.windows).toHaveLength(1)

@@ -34,6 +34,10 @@ export const GATEWAY_CREDENTIAL_REF = 'ZR_GATEWAY_TOKEN'
  * and the capacities must match what the gateway maps each alias to. `name` is
  * the selector label: it follows the vendor's public model name so the card
  * reads like the official provider, while requests still carry only the alias.
+ * Vision: the gateway fronts DeepSeek V4 models that accept images. The Models/Get
+ * catalog does not carry modalities, so {@link gatewayPatchBlock} declares
+ * `defaultInput: [text, image]` on the route (pi-ai otherwise defaults to text-only
+ * and the composer refuses attachments with MODEL_DOES_NOT_SUPPORT_IMAGES).
  */
 export const GATEWAY_MODELS = [
   { id: 'standard', name: 'DeepSeek-V4.1-Flash', contextWindow: 128_000, maxTokens: 8_192 },
@@ -43,6 +47,15 @@ export const GATEWAY_MODELS = [
 /** Generated block delimiters; re-running replaces the whole block between them. */
 export const GATEWAY_PATCH_BEGIN = '# zr-model-gateway:begin (regenerated on launch; edits inside this block are lost)'
 export const GATEWAY_PATCH_END = '# zr-model-gateway:end'
+
+/**
+ * Legacy separate retry patch. A later `- id: llm-pi-ai` row replaces the whole
+ * plugin config (loader assigns `config`, it does not deep-merge), so a
+ * retry-only row wiped `models` and produced INVALID_CONFIG. Retry now lives
+ * inside {@link gatewayPatchBlock}; this marker is stripped on ensure.
+ */
+export const LLM_RETRY_BEGIN = '# zr-llm-retry:begin (idempotent; keep outside zr-model-gateway block)'
+export const LLM_RETRY_END = '# zr-llm-retry:end'
 
 export interface GatewayModel {
   readonly id: string
@@ -221,6 +234,28 @@ export function gatewayPatchBlock(config: GatewayConfig): string {
     `        usageReportUrl: ${gatewayChatBaseUrl(config)}/Usage/Report`,
     '        compat:',
     '          thinkingFormat: deepseek',
+    // Catalog aliases are not in the installed pi-ai catalog, so without this
+    // the route falls back to text-only and image attach is refused client-side.
+    '        defaultInput:',
+    '          - text',
+    '          - image',
+    // Same plugin config is replaced wholesale by later id-targeted rows, so
+    // retry must sit on this provider object — never in a follow-up patch.
+    '        retryPolicy:',
+    '          mode: normal',
+    '          maxRetries: 5',
+    '          retryableCodes:',
+    '            - EMPTY_RESPONSE',
+    '            - RATE_LIMIT',
+    '            - SERVER',
+    '            - TIMEOUT',
+    '            - TRANSPORT',
+    '            - INVALID_REQUEST',
+    '            - PI_AI_ERROR',
+    '          backoff:',
+    '            initialDelayMs: 800',
+    '            maxDelayMs: 12000',
+    '            jitterRatio: 0.15',
     '        models:',
     ...config.models.flatMap(model => [
       `          - id: ${yamlScalar(model.id)}`,
@@ -236,6 +271,20 @@ export function gatewayPatchBlock(config: GatewayConfig): string {
     `    model: ${yamlScalar(first?.id ?? '')}`,
     GATEWAY_PATCH_END,
   ].join('\n')
+}
+
+/**
+ * Drop the legacy retry-only patch so it cannot replace the gateway models list.
+ * @param current - existing patch document.
+ * @returns document without the `# zr-llm-retry` block.
+ */
+export function stripLlmRetryBlock(current: string): string {
+  const start = current.indexOf(LLM_RETRY_BEGIN)
+  const end = start === -1 ? -1 : current.indexOf(LLM_RETRY_END, start)
+  if (start === -1 || end === -1) return current
+  const before = current.slice(0, start).replace(/\s+$/u, '')
+  const after = current.slice(end + LLM_RETRY_END.length).replace(/^\s+/u, '')
+  return `${before}${after ? `\n\n${after}` : '\n'}`
 }
 
 /**
@@ -281,12 +330,32 @@ export function ensureGatewayProfile(profileDir: string, config: GatewayConfig):
     const patchPath = join(profileDir, 'cordis.patch.yml')
     if (!existsSync(patchPath)) return
     const current = readFileSync(patchPath, 'utf8')
-    const next = applyGatewayPatch(current, gatewayPatchBlock(config))
+    const next = applyGatewayPatch(stripLlmRetryBlock(current), gatewayPatchBlock(config))
     if (next !== current) writeFileSync(patchPath, next)
   } catch (error) {
     // A profile write must never keep the app from starting; the route simply stays unregistered.
     console.error('desktop model gateway profile was not updated', error)
   }
+}
+
+/**
+ * Redacted login attempt for the console / gateway trace file.
+ * Password never appears: only its hashed length and whether Enterprise was sent.
+ */
+export function describeGatewayLoginAttempt(
+  url: string,
+  body: Readonly<Record<string, string>>,
+  result: { ok: true; status: number; ms: number } | { ok: false; ms: number; error: string },
+): string {
+  return JSON.stringify({
+    at: new Date().toISOString(),
+    method: 'POST',
+    url,
+    userName: body.UserName ?? '',
+    enterprise: body.Enterprise ?? null,
+    passwordChars: typeof body.Password === 'string' ? body.Password.length : 0,
+    ...result,
+  })
 }
 
 /**
@@ -301,7 +370,7 @@ export function ensureGatewayProfile(profileDir: string, config: GatewayConfig):
 export async function loginWithGateway(
   config: GatewayConfig,
   input: GatewayLoginInput,
-  options: { fetch?: GatewayFetch; now?: number; timeoutMs?: number } = {},
+  options: { fetch?: GatewayFetch; now?: number; timeoutMs?: number; traceDirectory?: string } = {},
 ): Promise<GatewayLoginOutcome> {
   const username = input.username.trim().toLowerCase()
   const password = input.password
@@ -315,16 +384,33 @@ export async function loginWithGateway(
   }
   const cid = enterpriseCid(input.enterpriseKey)
   if (cid !== '') body.Enterprise = cid
+  const url = `${config.baseUrl}/api/sys/user/UserLogin`
+  const started = Date.now()
   let response: Awaited<ReturnType<GatewayFetch>>
   try {
-    response = await fetchImpl(`${config.baseUrl}/api/sys/user/UserLogin`, {
+    response = await fetchImpl(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(options.timeoutMs ?? LOGIN_TIMEOUT_MS),
     })
-  } catch {
+  } catch (error) {
+    const ms = Date.now() - started
+    const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+    const line = describeGatewayLoginAttempt(url, body, { ok: false, ms, error: message })
+    console.error('desktop model gateway login unreachable', line)
+    writeGatewayLoginTrace(options.traceDirectory, line)
     return { ok: false, code: 'unreachable', detail: '无法连接登录服务，请检查网络后重试' }
+  }
+  {
+    const line = describeGatewayLoginAttempt(url, body, { ok: true, status: response.status, ms: Date.now() - started })
+    // Failures always leave a local trace. Successful HTTP responses only log when
+    // field diagnosis is opted in, so usernames are not written on every normal login.
+    const traceSuccess = process.env.DSH_GATEWAY_LOGIN_TRACE === '1'
+    if (!response.ok || traceSuccess) {
+      console.error('desktop model gateway login response', line)
+      writeGatewayLoginTrace(options.traceDirectory, line)
+    }
   }
   if (response.status === 401) return { ok: false, code: 'invalid', detail: '用户名或密码错误' }
   if (response.status === 403) return { ok: false, code: 'forbidden', detail: '该账号没有登录权限' }
@@ -474,6 +560,31 @@ export function writeGatewayModelsCache(directory: string, catalog: GatewayCatal
     writeFileSync(join(directory, 'models.json'), JSON.stringify({ version: 1, ...catalog }))
   } catch (error) {
     console.error('desktop model gateway catalog was not cached', error)
+  }
+}
+
+/** Keep at most this many JSONL lines so local diagnosis does not grow without bound. */
+const LOGIN_TRACE_MAX_LINES = 200
+
+/**
+ * Append one redacted login attempt line for field diagnosis.
+ * @param directory - `<userData>/gateway`; omitted skips the file write.
+ * @param line - JSON from {@link describeGatewayLoginAttempt}.
+ */
+function writeGatewayLoginTrace(directory: string | undefined, line: string): void {
+  if (directory === undefined || directory.trim() === '') return
+  try {
+    if (!existsSync(directory)) mkdirSync(directory, { recursive: true })
+    writeFileSync(join(directory, 'login-last.json'), `${line}\n`)
+    const logPath = join(directory, 'login-trace.jsonl')
+    let prior = ''
+    try { prior = readFileSync(logPath, 'utf8') } catch { /* first write */ }
+    const lines = prior === '' ? [] : prior.split('\n').filter(entry => entry.length > 0)
+    lines.push(line)
+    const kept = lines.length <= LOGIN_TRACE_MAX_LINES ? lines : lines.slice(-LOGIN_TRACE_MAX_LINES)
+    writeFileSync(logPath, `${kept.join('\n')}\n`)
+  } catch (error) {
+    console.error('desktop model gateway login trace was not written', error)
   }
 }
 

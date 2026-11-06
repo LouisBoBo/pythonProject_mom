@@ -4,7 +4,10 @@ import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import {
   GATEWAY_MODELS,
+  LLM_RETRY_BEGIN,
+  LLM_RETRY_END,
   applyGatewayPatch,
+  describeGatewayLoginAttempt,
   ensureGatewayProfile,
   fetchGatewayModels,
   gatewayLoginPassword,
@@ -15,6 +18,7 @@ import {
   parseTokenExpires,
   readGatewayModelsCache,
   resolveGatewayConfig,
+  stripLlmRetryBlock,
   writeGatewayModelsCache,
   type GatewayConfig,
   type GatewayFetch,
@@ -135,6 +139,9 @@ it('generates a block that registers the route and the default model', () => {
   expect(block).toContain('model: "standard"')
   expect(block).toContain('- id: "standard"\n            name: "Flash"')
   expect(block).toContain('- id: "deep"\n            name: "Pro"')
+  expect(block).toContain('retryPolicy:')
+  expect(block).toContain('INVALID_REQUEST')
+  expect(block).toContain('defaultInput:\n          - text\n          - image')
   expect(block).not.toContain('sk-')
 })
 
@@ -200,6 +207,34 @@ it('writes the profile only when the result differs', () => {
   expect(written).toContain('zr-gateway')
   ensureGatewayProfile(root, config)
   expect(readFileSync(patchPath, 'utf8')).toBe(written)
+})
+
+it('strips a legacy retry-only patch that would replace gateway models', () => {
+  const legacy = [
+    gatewayPatchBlock(config),
+    '',
+    LLM_RETRY_BEGIN,
+    '- id: llm-pi-ai',
+    '  config:',
+    '    providers:',
+    '      zr-gateway:',
+    '        retryPolicy:',
+    '          mode: normal',
+    LLM_RETRY_END,
+    '',
+  ].join('\n')
+  expect(stripLlmRetryBlock(legacy)).not.toContain(LLM_RETRY_BEGIN)
+  expect(stripLlmRetryBlock(legacy)).toContain('models:')
+
+  const root = directory()
+  const patchPath = join(root, 'cordis.patch.yml')
+  writeFileSync(patchPath, legacy)
+  ensureGatewayProfile(root, config)
+  const written = readFileSync(patchPath, 'utf8')
+  expect(written).not.toContain(LLM_RETRY_BEGIN)
+  expect(written).toContain('retryPolicy:')
+  expect(written).toContain('- id: "standard"')
+  expect(written.match(/- id: llm-pi-ai/g)).toHaveLength(1)
 })
 
 it('reports a write failure without throwing', () => {
@@ -302,9 +337,19 @@ it('maps gateway rejections to card copy', async () => {
 
 it('never surfaces transport or payload details', async () => {
   const offline: GatewayFetch = async () => { throw new Error('ECONNREFUSED 10.0.0.1') }
-  expect(await loginWithGateway(config, input, { fetch: offline })).toEqual({
+  const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const root = directory()
+  expect(await loginWithGateway(config, input, { fetch: offline, traceDirectory: root })).toEqual({
     ok: false, code: 'unreachable', detail: '无法连接登录服务，请检查网络后重试',
   })
+  const trace = readFileSync(join(root, 'login-last.json'), 'utf8')
+  expect(trace).toContain('ECONNREFUSED')
+  expect(trace).toContain('/api/sys/user/UserLogin')
+  expect(trace).not.toContain(input.password)
+  expect(describeGatewayLoginAttempt('http://g/api/sys/user/UserLogin', { UserName: 'a', Password: 'x'.repeat(16) }, {
+    ok: false, ms: 1, error: 'TypeError: fetch failed',
+  })).toContain('passwordChars":16')
+  error.mockRestore()
 
   const brokenJson: GatewayFetch = async () => ({
     ok: true, status: 200, headers: { get: () => null }, json: async () => { throw new Error('unexpected token <') },
@@ -324,11 +369,12 @@ it('logs out with a bearer token and accepts the success envelope', async () => 
   const ok = await logoutWithGateway(config, ' session-tok ', { fetch: respond(200, { data: { Success: true, Content: '', Datas: null } }, calls) })
   expect(ok).toBe(true)
   expect(calls).toHaveLength(1)
-  expect(calls[0].url).toBe('https://gateway.example/api/sys/user/UserLogout')
-  expect(calls[0].init.method).toBe('POST')
-  expect(calls[0].init.headers.authorization).toBe('Bearer session-tok')
-  expect(calls[0].init.headers['content-type']).toBe('application/json')
-  expect(calls[0].init.body).toBe('{}')
+  const [call] = calls
+  expect(call?.url).toBe('https://gateway.example/api/sys/user/UserLogout')
+  expect(call?.init.method).toBe('POST')
+  expect(call?.init.headers.authorization).toBe('Bearer session-tok')
+  expect(call?.init.headers['content-type']).toBe('application/json')
+  expect(call?.init.body).toBe('{}')
 })
 
 it('treats an expired token as already signed out', async () => {
@@ -363,10 +409,11 @@ it('fetches the model catalog and puts the default alias first', async () => {
   expect(catalog?.models.map(model => model.id)).toEqual(['standard', 'deep'])
   expect(catalog?.models[0]).toEqual({ id: 'standard', name: 'Flash', contextWindow: 128000, maxTokens: 8192 })
   expect(calls).toHaveLength(1)
-  expect(calls[0].url).toBe('https://gateway.example/api/ai/Models/Get')
-  expect(calls[0].init.method).toBe('GET')
-  expect(calls[0].init.headers.authorization).toBe('Bearer tok')
-  expect(calls[0].init.body).toBeUndefined()
+  const [call] = calls
+  expect(call?.url).toBe('https://gateway.example/api/ai/Models/Get')
+  expect(call?.init.method).toBe('GET')
+  expect(call?.init.headers.authorization).toBe('Bearer tok')
+  expect(call?.init.body).toBeUndefined()
 
   const reordered = await fetchGatewayModels(config, 'tok', {
     fetch: respond(200, catalogDatas([

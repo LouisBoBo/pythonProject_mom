@@ -1,11 +1,22 @@
 /** Saved application shell so the next launch can paint before the Host is ready. */
 
 import { createHash } from 'node:crypto'
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 
 /** Origin the page uses until the Host binds its port. Nothing listens here, so the socket fails fast and retries. */
 export const DESKTOP_SHELL_PENDING_ORIGIN = 'http://127.0.0.1:9'
+
+/** On-disk names written by {@link writeDesktopShellSnapshot}: body SHA-1 hex + `.js`. */
+const SHELL_CACHE_FILE = /^[a-f0-9]{40}\.js$/u
+
+/**
+ * Whether a snapshot index entry is a safe relative file name under the cache directory.
+ * Rejects path segments that could escape the directory via a tampered `index.json`.
+ */
+export function isShellCacheFileName(name: string): boolean {
+  return SHELL_CACHE_FILE.test(name)
+}
 
 /** One launch's boot rows, with plugin script bytes stored beside the index. */
 export interface DesktopShellSnapshot {
@@ -154,9 +165,12 @@ export function readDesktopShellSnapshot(home: string, version: string): Desktop
     const snapshot = parsed as { version?: unknown, injections?: unknown, files?: unknown }
     if (snapshot.version !== version || !Array.isArray(snapshot.injections)) return undefined
     if (typeof snapshot.files !== 'object' || snapshot.files === null) return undefined
+    const root = resolve(directory)
     const files = new Map<string, string>()
     for (const [key, name] of Object.entries(snapshot.files)) {
-      if (typeof name !== 'string' || shellScriptKey(key) !== key) return undefined
+      if (typeof name !== 'string' || shellScriptKey(key) !== key || !isShellCacheFileName(name)) return undefined
+      const absolute = resolve(directory, name)
+      if (absolute !== join(root, name)) return undefined
       files.set(key, name)
     }
     return {
@@ -183,21 +197,31 @@ export function writeDesktopShellSnapshot(home: string, snapshot: DesktopShellSn
   const directory = desktopShellSnapshotPath(home)
   mkdirSync(directory, { recursive: true })
   const files: Record<string, string> = {}
+  const keep = new Set<string>(['index.json'])
   for (const key of snapshot.keys()) {
     const body = snapshot.read(key)
     if (body === undefined) throw new Error('desktop shell: snapshot is missing a script body')
-    const name = `${createHash('sha1').update(key).digest('hex')}.js`
+    // Hash the body so identical scripts across revision query changes share one file,
+    // and so a rewrite can drop every name the live index no longer references.
+    const name = `${createHash('sha1').update(body).digest('hex')}.js`
     const path = join(directory, name)
     const temporary = `${path}.tmp`
     writeFileSync(temporary, body)
     try { renameSync(temporary, path) } catch { rmSync(path, { force: true }); renameSync(temporary, path) }
     files[key] = name
+    keep.add(name)
   }
   const index = join(directory, 'index.json')
   const temporary = `${index}.tmp`
   writeFileSync(temporary, JSON.stringify({ version: snapshot.version, injections: snapshot.injections, files }))
   try { renameSync(temporary, index) } catch { rmSync(index, { force: true }); renameSync(temporary, index) }
   rmSync(join(home, 'desktop-shell.json'), { force: true })
+  // Asar-stamped revisions used to leave unbounded orphans (multi-GB). Drop only
+  // prior script blobs the live index no longer names.
+  for (const entry of readdirSync(directory)) {
+    if (keep.has(entry) || !isShellCacheFileName(entry)) continue
+    rmSync(join(directory, entry), { force: true })
+  }
 }
 
 /**

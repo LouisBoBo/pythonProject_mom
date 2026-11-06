@@ -386,7 +386,12 @@ async function main(): Promise<void> {
   let hostEnvironment: NodeJS.ProcessEnv = process.env
   const gatewayModelsDirectory = join(app.getPath('userData'), 'gateway')
   const prepareHostEnvironment = async (): Promise<void> => {
-    hostEnvironment = await loginShell
+    // Host spawn must never await shell probes. Keep whatever the probe already
+    // produced after one microtask; a still-pending read leaves the launcher env.
+    let probeEnvironment: NodeJS.ProcessEnv | undefined
+    void loginShell.then((environment) => { probeEnvironment = environment })
+    await Promise.resolve()
+    hostEnvironment = probeEnvironment ?? process.env
     if (gateway === undefined) return
     // The catalog can only refresh after a login, so startup uses the cache
     // from the last one; the built-in list covers a fresh or broken cache.
@@ -399,8 +404,6 @@ async function main(): Promise<void> {
   let startup: Promise<void> | undefined
   let workspaceRecovery: Promise<void> | undefined
   let mainWindow: BrowserWindow | undefined
-  let releaseStartupPaint = (): void => {}
-  const startupPainted = new Promise<void>((resolve) => { releaseStartupPaint = resolve })
   let welcomeWindow: WelcomeSurface | undefined
   let enteredWorkspace = false
   // NSIS passes --updated when it launches the application after installation.
@@ -498,16 +501,24 @@ async function main(): Promise<void> {
     })()`
     // A cached-shell boot depends on this one injection; while the frame is still settling it can
     // reject or hang once and leave the page on the pending origin forever. Retry until one lands.
+    // A hang used to wait two seconds. The Host now starts beside the first paint, so the frame
+    // may not exist yet: back off briefly instead of spinning, and retry a hang quickly.
     const deadline = Date.now() + 120_000
     let injected = false
     const attempt = (): void => {
       if (injected || quitting || shuttingDown || window.isDestroyed() || Date.now() >= deadline) return
       let settled = false
-      const retry = setTimeout(() => { if (!settled) { settled = true; attempt() } }, 2_000)
+      const retry = setTimeout(() => { if (!settled) { settled = true; attempt() } }, 200)
       retry.unref()
       void Promise.resolve(execute.call(window.webContents, source)).then(
         () => { injected = true; settled = true; clearTimeout(retry) },
-        () => { if (settled) return; settled = true; clearTimeout(retry); attempt() },
+        () => {
+          if (settled) return
+          settled = true
+          clearTimeout(retry)
+          const again = setTimeout(attempt, 50)
+          again.unref()
+        },
       )
     }
     attempt()
@@ -700,7 +711,7 @@ async function main(): Promise<void> {
       if (hostReady !== undefined && startup === hostReady) startup = undefined
     }
   }
-  // The Host starts after the startup screen is visible. See reconcileBackend.
+  // The Host starts beside the startup screen. See reconcileBackend.
 
   const updateErrors = new WeakMap<DesktopUpdateState, Promise<void>>()
   const showUpdateFailure = (state: DesktopUpdateState): Promise<void> => {
@@ -735,6 +746,8 @@ async function main(): Promise<void> {
           // A replacement Host can have a new port, cookie, or boot injections even at the same URL.
           navigation = undefined
           await navigateMain(applicationUrl)
+          // Same readiness signal as cold start: locale preference after Host URL exists.
+          await openInitialWindow()
           if (backend.host !== undefined) updateJournal?.action('workspace-ready')
         })
         workspaceRecovery = recovery
@@ -774,8 +787,9 @@ async function main(): Promise<void> {
   const reconcileBackend = (): Promise<void> => {
     startup ??= (async () => {
       // The boot page is the startup screen. Login is decided after that page finishes.
+      // The Host does not wait for the first frame: profile preparation and the child
+      // process run while that frame paints. The window stays hidden until the frame is ready.
       void navigateMain(applicationUrl).catch((error: unknown) => { reportFatal(error, 'main') })
-      await startupPainted
       const hostReady = backend.start(async () => {
         await Promise.all([manager.applyRelease(), prepareHostEnvironment()])
         if (companyMarketScript(app.isPackaged, process.resourcesPath) !== undefined) {
@@ -786,8 +800,14 @@ async function main(): Promise<void> {
       })
       await hostReady
       if (backend.host !== undefined) {
-        await openInitialWindow()
-        if (backend.host !== undefined) updateJournal?.action('workspace-ready')
+        // The page can boot as soon as the Host URL exists. Reading the locale
+        // preference is one more round trip and must not hold the startup screen.
+        void openInitialWindow().then(() => {
+          if (backend.host !== undefined) updateJournal?.action('workspace-ready')
+        }).catch((error: unknown) => {
+          updateJournal?.action('workspace-failed')
+          reportFatal(error, 'main')
+        })
       }
       // The existing Web document resumes through the boot IPC response.
     })().catch((error: unknown) => {
@@ -1352,7 +1372,6 @@ async function main(): Promise<void> {
     }
     window.once('ready-to-show', () => {
       if (!quitting && !window.isDestroyed()) window.show()
-      releaseStartupPaint()
     })
     window.on('closed', () => { if (mainWindow === window) mainWindow = undefined })
     window.webContents.on('console-message', (details) => {
@@ -1360,7 +1379,6 @@ async function main(): Promise<void> {
       rendererConsole.push(`${details.sourceId}:${String(details.lineNumber)} ${details.message}`)
     })
     window.webContents.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
-      if (isMainFrame) releaseStartupPaint()
       if (isMainFrame && code !== -3 && !quitting && !window.isDestroyed()) {
         reportFatal(new Error(`Desktop page failed to load: ${url} (${String(code)}: ${description})`), 'renderer')
       }
@@ -1451,7 +1469,7 @@ async function main(): Promise<void> {
             finishLogin()
             return { ok: true }
           }
-          const outcome = await loginWithGateway(gateway, input)
+          const outcome = await loginWithGateway(gateway, input, { traceDirectory: gatewayModelsDirectory })
           if (!outcome.ok) return { ok: false, code: outcome.code, detail: outcome.detail }
           if (welcomeBackend === undefined) {
             return { ok: false, code: 'server', detail: '登录服务暂时不可用，请稍后再试' }

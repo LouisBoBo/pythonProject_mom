@@ -1,6 +1,7 @@
 /** Electron Node-mode child lifecycle for the shared Web application. */
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { PlatformSession } from '@deepseek-ai/dsh-deepseek-account'
 import { desktopNodeEnvironment } from './node-environment.ts'
@@ -103,6 +104,26 @@ async function exitsWithin(exit: Promise<void>, milliseconds: number): Promise<b
   }
 }
 
+/**
+ * Directory for Node's module compile cache, so the next Host launch skips
+ * parsing the same plugins. A missing home, or a directory that cannot be
+ * created, leaves the cache off and the Host still starts.
+ * @param environment - Environment the Host will inherit.
+ * @returns Cache directory, or undefined when the cache must stay off.
+ */
+export function hostCompileCacheDirectory(environment: NodeJS.ProcessEnv): string | undefined {
+  if (environment.NODE_COMPILE_CACHE !== undefined) return undefined
+  const home = environment.DSH_HOME
+  if (typeof home !== 'string' || home.trim() === '') return undefined
+  const directory = join(home, 'node-compile-cache')
+  try {
+    mkdirSync(directory, { recursive: true })
+  } catch {
+    return undefined
+  }
+  return directory
+}
+
 /** Browser authentication URL reported by the running Web application. */
 export interface DesktopHostReady {
   readonly url: string
@@ -186,6 +207,7 @@ export class DesktopHostProcess {
   async start(): Promise<DesktopHostReady> {
     if (this.child !== undefined) return this.readyPromise
     const entry = join(this.runtimeDir, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'index.js')
+    const compileCache = hostCompileCacheDirectory(this.environment)
     const child = spawn(this.node, [
       '--expose-internals',
       ...(this.inspectPort === undefined ? [] : [`--inspect=127.0.0.1:${String(this.inspectPort)}`]),
@@ -200,6 +222,7 @@ export class DesktopHostProcess {
         ...this.environment,
         DSH_TYPERT_BACKGROUND: '1',
         DSH_DESKTOP_EARLY_UI: '1',
+        ...(compileCache === undefined ? {} : { NODE_COMPILE_CACHE: compileCache }),
       }),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     })
@@ -305,7 +328,8 @@ export class DesktopHostProcess {
       }
     }
     this.child = undefined
-    if (requireGraceful && (!graceful || child.exitCode !== 0 || !this.shutdownCompleted)) {
+    // A Host that finishes task teardown after the graceful deadline but still acknowledges shutdown and exits 0 completed the handoff.
+    if (requireGraceful && (child.exitCode !== 0 || !this.shutdownCompleted)) {
       // This diagnostic reaches expandable UI; arbitrary plugin stderr can contain credentials.
       throw new DesktopHostUncleanExitError(`desktop update: Host did not complete graceful task teardown (exit ${String(child.exitCode)}, signal ${String(child.signalCode)}, shutdown acknowledged ${String(this.shutdownCompleted)}, graceful deadline exceeded ${String(!graceful)})`)
     }

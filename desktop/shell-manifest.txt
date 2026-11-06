@@ -70,9 +70,12 @@ apps/desktop/src/company-market.ts
 apps/desktop/src/local-login.ts
 apps/desktop/src/login-enterprises.ts
 apps/desktop/src/shell-cache.ts
+apps/desktop/src/login-shell-environment.ts
 apps/desktop/src/plugin-visibility.ts
 apps/desktop/tests/local-login.spec.ts
 apps/desktop/tests/shell-cache.spec.ts
+apps/desktop/tests/login-shell-environment.spec.ts
+apps/desktop/tests/host-process.spec.ts
 apps/desktop/tests/plugin-visibility.spec.ts
 apps/desktop/src/ipc.ts
 apps/desktop/src/web-document.ts
