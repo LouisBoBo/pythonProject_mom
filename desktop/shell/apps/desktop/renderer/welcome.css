@@ -160,6 +160,28 @@ body {
 }
 .ent-option { padding: 8px 10px; border-radius: 8px; cursor: pointer; }
 .ent-option.active, .ent-option:hover { background: #eef7f1; }
+.wb-login-form .captcha-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.wb-login-form .captcha-row input { flex: 1; min-width: 0; }
+.wb-login-form .captcha-image {
+  flex: 0 0 auto;
+  height: 40px;
+  padding: 0;
+  border: 1px solid #dbe1ea;
+  border-radius: 10px;
+  background: #fff;
+  cursor: pointer;
+  overflow: hidden;
+}
+.wb-login-form .captcha-image img {
+  display: block;
+  height: 40px;
+  width: auto;
+}
+.wb-login-form .captcha-image:disabled { opacity: 0.7; cursor: default; }
 .wb-login-form .error {
   margin: 0;
   padding: 8px 10px;

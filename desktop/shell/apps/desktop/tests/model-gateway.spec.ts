@@ -12,13 +12,17 @@ import {
   fetchGatewayModels,
   gatewayLoginPassword,
   gatewayPatchBlock,
+  fetchGatewayCaptcha,
   loginWithGateway,
   logoutWithGateway,
+  normalizeCaptchaField,
+  normalizeCaptchaImageBase64,
   parseGatewayBaseUrl,
   parseTokenExpires,
   readGatewayModelsCache,
   resolveGatewayConfig,
   stripLlmRetryBlock,
+  validateGatewayToken,
   writeGatewayModelsCache,
   type GatewayConfig,
   type GatewayFetch,
@@ -140,7 +144,9 @@ it('generates a block that registers the route and the default model', () => {
   expect(block).toContain('- id: "standard"\n            name: "Flash"')
   expect(block).toContain('- id: "deep"\n            name: "Pro"')
   expect(block).toContain('retryPolicy:')
-  expect(block).toContain('INVALID_REQUEST')
+  expect(block).toContain('EMPTY_RESPONSE')
+  expect(block).toContain('RATE_LIMIT')
+  expect(block).not.toContain('INVALID_REQUEST')
   expect(block).toContain('defaultInput:\n          - text\n          - image')
   expect(block).not.toContain('sk-')
 })
@@ -321,11 +327,65 @@ it('shows the server content when the credentials are rejected', async () => {
     ok: false, code: 'invalid', detail: '用户名或密码不正确!',
   })
   expect(await loginWithGateway(config, input, { fetch: respond(200, rejection('用户名或密码不正确，请输入验证码')) })).toMatchObject({
-    ok: false, code: 'invalid', detail: '用户名或密码不正确，请输入验证码',
+    ok: false, code: 'captcha', needCaptcha: true, detail: '用户名或密码不正确，请输入验证码',
   })
+  expect(await loginWithGateway(config, input, {
+    fetch: respond(200, {
+      code: 200,
+      success: true,
+      data: { Success: false, Content: '用户名或密码不正确，请输入验证码', Datas: { NeedCaptcha: true, Locked: false } },
+    }),
+  })).toMatchObject({ ok: false, code: 'captcha', needCaptcha: true })
   expect(await loginWithGateway(config, input, { fetch: respond(200, rejection('')) })).toMatchObject({
     ok: false, code: 'invalid', detail: '用户名或密码错误',
   })
+})
+
+it('posts captcha fields only when the card supplies both', async () => {
+  const calls: Call[] = []
+  await loginWithGateway(config, { ...input, captchaId: 'c1', captchaCode: 'AB12' }, {
+    fetch: respond(200, envelope({ CUSER_NAME: 'louis' }), calls, { Token: 'tok' }),
+  })
+  expect(JSON.parse(calls[0]?.init.body ?? '{}')).toMatchObject({
+    UserName: 'louis', CaptchaId: 'c1', CaptchaCode: 'AB12',
+  })
+})
+
+it('treats ValidateToken 401 as expired and network errors as still usable', async () => {
+  expect(await validateGatewayToken(config, 'tok', { fetch: respond(401, {}) })).toBe(false)
+  expect(await validateGatewayToken(config, 'tok', { fetch: respond(200, envelope(null)) })).toBe(true)
+  expect(await validateGatewayToken(config, 'tok', {
+    fetch: respond(200, { code: 200, success: true, data: { Success: false, Content: 'Token已失效' } }),
+  })).toBe(false)
+  const offline: GatewayFetch = async () => { throw new Error('offline') }
+  expect(await validateGatewayToken(config, 'tok', { fetch: offline })).toBe(true)
+})
+
+it('loads a captcha image from GetCaptcha', async () => {
+  const captcha = await fetchGatewayCaptcha(config, {
+    fetch: respond(200, envelope({ CaptchaId: 'id-1', ImageBase64: 'YWFh' })),
+  })
+  expect(captcha).toEqual({ captchaId: 'id-1', imageBase64: 'YWFh' })
+  expect(await fetchGatewayCaptcha(config, { fetch: respond(500, {}) })).toBeUndefined()
+})
+
+it('rejects unsafe captcha payloads before they reach the card', () => {
+  expect(normalizeCaptchaImageBase64('YWFh')).toBe('YWFh')
+  expect(normalizeCaptchaImageBase64('data:image/png;base64,YWFh')).toBe('')
+  expect(normalizeCaptchaImageBase64('YWFh!')).toBe('')
+  expect(normalizeCaptchaImageBase64('a'.repeat(300_000))).toBe('')
+  expect(normalizeCaptchaField('ok-id', 128)).toBe('ok-id')
+  expect(normalizeCaptchaField('x'.repeat(200), 128)).toBe('')
+  expect(normalizeCaptchaField('bad id', 128)).toBe('')
+})
+
+it('drops GetCaptcha rows with oversized or non-base64 images', async () => {
+  expect(await fetchGatewayCaptcha(config, {
+    fetch: respond(200, envelope({ CaptchaId: 'id-1', ImageBase64: 'data:image/png;base64,YWFh' })),
+  })).toBeUndefined()
+  expect(await fetchGatewayCaptcha(config, {
+    fetch: respond(200, envelope({ CaptchaId: 'id-1', ImageBase64: 'not base64!!' })),
+  })).toBeUndefined()
 })
 
 it('maps gateway rejections to card copy', async () => {

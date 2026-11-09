@@ -9,6 +9,7 @@ export const WELCOME_IPC = {
   saveApiKey: 'dsh-welcome:save-api-key',
   submitLogin: 'dsh-welcome:submit-login',
   loginGate: 'dsh-welcome:login-gate',
+  fetchCaptcha: 'dsh-welcome:fetch-captcha',
   analytics: 'dsh-welcome:analytics',
   analyticsEnabled: 'dsh-welcome:analytics-enabled',
   skip: 'dsh-welcome:skip',
@@ -27,12 +28,26 @@ export interface WelcomeLoginInput {
   readonly username: string
   readonly password: string
   readonly enterpriseKey: string
+  readonly captchaId?: string
+  readonly captchaCode?: string
 }
 
 /** Local login outcome safe to show on the card. */
 export type WelcomeLoginResult =
   | { readonly ok: true }
-  | { readonly ok: false, readonly code: string, readonly detail: string }
+  | {
+      readonly ok: false
+      readonly code: string
+      readonly detail: string
+      readonly needCaptcha?: boolean
+      readonly locked?: boolean
+    }
+
+/** Captcha image the card shows after the server asks for one. */
+export interface WelcomeCaptcha {
+  readonly captchaId: string
+  readonly imageBase64: string
+}
 
 /** Whether the card should enroll the first administrator or check an existing account. */
 export interface WelcomeLoginGate {
@@ -71,6 +86,8 @@ export interface WelcomeOperations {
    * @returns a card-safe outcome. The password is not echoed.
    */
   submitLogin(input: WelcomeLoginInput): Promise<WelcomeLoginResult>
+  /** @returns a fresh captcha, or undefined when the gateway is unavailable. */
+  fetchCaptcha(): Promise<WelcomeCaptcha | undefined>
   /** @returns whether an account file already exists. */
   loginGate(): Promise<WelcomeLoginGate>
   /**

@@ -75,6 +75,9 @@ export interface GatewayLoginInput {
   readonly username: string
   readonly password: string
   readonly enterpriseKey: string
+  /** From {@link fetchGatewayCaptcha}; required after three failed attempts. */
+  readonly captchaId?: string
+  readonly captchaCode?: string
 }
 
 /** Card-safe login outcome: a success carries the token, a failure carries display copy. */
@@ -87,7 +90,19 @@ export type GatewayLoginOutcome =
       readonly displayName: string
       readonly enterpriseKey: string
     }
-  | { readonly ok: false, readonly code: string, readonly detail: string }
+  | {
+      readonly ok: false
+      readonly code: string
+      readonly detail: string
+      readonly needCaptcha?: boolean
+      readonly locked?: boolean
+    }
+
+export interface GatewayCaptcha {
+  readonly captchaId: string
+  /** PNG base64 without a data-URL prefix. */
+  readonly imageBase64: string
+}
 
 /** The narrow slice of `fetch` this module needs, so tests can supply a fake. */
 export type GatewayFetch = (
@@ -241,6 +256,10 @@ export function gatewayPatchBlock(config: GatewayConfig): string {
     '          - image',
     // Same plugin config is replaced wholesale by later id-targeted rows, so
     // retry must sit on this provider object — never in a follow-up patch.
+    // Do not retry INVALID_REQUEST: stream-guard rewrites gateway business
+    // failures (HTTP 200 + Success=false) into 400 + Chinese text, which pi-ai
+    // maps to INVALID_REQUEST. Retrying that only burns 5 attempts on the same
+    // upstream outage and shows "已重试模型请求 (5/5)".
     '        retryPolicy:',
     '          mode: normal',
     '          maxRetries: 5',
@@ -250,7 +269,6 @@ export function gatewayPatchBlock(config: GatewayConfig): string {
     '            - SERVER',
     '            - TIMEOUT',
     '            - TRANSPORT',
-    '            - INVALID_REQUEST',
     '            - PI_AI_ERROR',
     '          backoff:',
     '            initialDelayMs: 800',
@@ -384,6 +402,12 @@ export async function loginWithGateway(
   }
   const cid = enterpriseCid(input.enterpriseKey)
   if (cid !== '') body.Enterprise = cid
+  const captchaId = normalizeCaptchaField(input.captchaId, CAPTCHA_ID_MAX)
+  const captchaCode = normalizeCaptchaField(input.captchaCode, CAPTCHA_CODE_MAX)
+  if (captchaId !== '' && captchaCode !== '') {
+    body.CaptchaId = captchaId
+    body.CaptchaCode = captchaCode
+  }
   const url = `${config.baseUrl}/api/sys/user/UserLogin`
   const started = Date.now()
   let response: Awaited<ReturnType<GatewayFetch>>
@@ -426,7 +450,22 @@ export async function loginWithGateway(
   if (result === undefined) return { ok: false, code: 'server', detail: '登录服务返回了无法识别的内容' }
   if (result.Success === false) {
     const content = typeof result.Content === 'string' ? result.Content.trim() : ''
-    return { ok: false, code: 'invalid', detail: content === '' ? '用户名或密码错误' : content }
+    const datas = typeof result.Datas === 'object' && result.Datas !== null
+      ? result.Datas as Record<string, unknown>
+      : undefined
+    // Prefer the server flag. Only fall back to Content text when Datas is absent,
+    // so ordinary password-error copy never forces a captcha field by accident.
+    const needCaptcha = datas?.NeedCaptcha === true
+      || (datas === undefined && /验证码/u.test(content))
+    const locked = datas?.Locked === true
+      || (datas === undefined && /账号已被锁定/u.test(content))
+    return {
+      ok: false,
+      code: locked ? 'locked' : needCaptcha ? 'captcha' : 'invalid',
+      detail: content === '' ? '用户名或密码错误' : content,
+      ...needCaptcha ? { needCaptcha: true } : {},
+      ...locked ? { locked: true } : {},
+    }
   }
   if (result.Success !== true) return { ok: false, code: 'server', detail: '登录服务返回了无法识别的内容' }
   const token = headerValue(response.headers, 'Token')
@@ -451,6 +490,117 @@ const defaultFetch: GatewayFetch = (url, init) => fetch(url, init)
 
 const LOGOUT_TIMEOUT_MS = 5_000
 const MODELS_TIMEOUT_MS = 10_000
+const VALIDATE_TIMEOUT_MS = 8_000
+const CAPTCHA_TIMEOUT_MS = 10_000
+/** Captcha id / code wire limits — anything larger is treated as unusable. */
+const CAPTCHA_ID_MAX = 128
+const CAPTCHA_CODE_MAX = 32
+/** ~256 KiB of base64 (~192 KiB decoded); real PNG captchas are far smaller. */
+const CAPTCHA_IMAGE_BASE64_MAX = 256 * 1024
+const CAPTCHA_IMAGE_BASE64 = /^[A-Za-z0-9+/]+=*$/u
+
+/**
+ * Accept only a bounded, alphabet-safe captcha image payload for the welcome card.
+ * @param raw - `ImageBase64` from GetCaptcha.
+ * @returns the trimmed value, or empty when unsafe.
+ */
+export function normalizeCaptchaImageBase64(raw: string | undefined): string {
+  const value = raw?.trim() ?? ''
+  if (value === '' || value.length > CAPTCHA_IMAGE_BASE64_MAX) return ''
+  if (value.includes('data:') || value.includes(',') || value.includes('.')) return ''
+  return CAPTCHA_IMAGE_BASE64.test(value) ? value : ''
+}
+
+/**
+ * Accept a short captcha id / typed code for the login body.
+ * @param raw - field from the card or GetCaptcha.
+ * @param max - inclusive length limit.
+ * @returns the trimmed value, or empty when oversized/blank.
+ */
+export function normalizeCaptchaField(raw: string | undefined, max: number): string {
+  const value = raw?.trim() ?? ''
+  if (value === '' || value.length > max) return ''
+  if (!/^[\x21-\x7e]+$/u.test(value)) return ''
+  return value
+}
+
+/**
+ * Confirm the access token is still accepted by the gateway.
+ * HTTP 401 or a business rejection both mean the remembered session must re-login.
+ * Transport failures resolve true so a temporary outage does not force a password prompt.
+ * @param config - resolved gateway.
+ * @param token - session token from login or the persisted local copy.
+ * @param options - fetch implementation and timeout for tests.
+ */
+export async function validateGatewayToken(
+  config: GatewayConfig,
+  token: string,
+  options: { fetch?: GatewayFetch; timeoutMs?: number } = {},
+): Promise<boolean> {
+  const trimmed = token.trim()
+  if (trimmed === '') return false
+  const fetchImpl = options.fetch ?? defaultFetch
+  let response: Awaited<ReturnType<GatewayFetch>>
+  try {
+    response = await fetchImpl(`${config.baseUrl}/api/sys/user/ValidateToken`, {
+      method: 'GET',
+      headers: { authorization: `Bearer ${trimmed}`, accept: 'application/json' },
+      signal: AbortSignal.timeout(options.timeoutMs ?? VALIDATE_TIMEOUT_MS),
+    })
+  } catch {
+    return true
+  }
+  if (response.status === 401) return false
+  if (!response.ok) return true
+  try {
+    const result = readFunctionResult(await response.json())
+    if (result === undefined) return true
+    return result.Success === true
+  } catch {
+    return true
+  }
+}
+
+/**
+ * Fetch a login captcha image after the server asks for one.
+ * @param config - resolved gateway.
+ * @param options - fetch implementation and timeout for tests.
+ */
+export async function fetchGatewayCaptcha(
+  config: GatewayConfig,
+  options: { fetch?: GatewayFetch; timeoutMs?: number } = {},
+): Promise<GatewayCaptcha | undefined> {
+  const fetchImpl = options.fetch ?? defaultFetch
+  let response: Awaited<ReturnType<GatewayFetch>>
+  try {
+    response = await fetchImpl(`${config.baseUrl}/api/sys/user/GetCaptcha`, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(options.timeoutMs ?? CAPTCHA_TIMEOUT_MS),
+    })
+  } catch {
+    return undefined
+  }
+  if (!response.ok) return undefined
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    return undefined
+  }
+  const result = readFunctionResult(payload)
+  if (result?.Success !== true || typeof result.Datas !== 'object' || result.Datas === null) return undefined
+  const datas = result.Datas as Record<string, unknown>
+  const captchaId = normalizeCaptchaField(
+    typeof datas.CaptchaId === 'string' ? datas.CaptchaId : undefined,
+    CAPTCHA_ID_MAX,
+  )
+  const imageBase64 = normalizeCaptchaImageBase64(
+    typeof datas.ImageBase64 === 'string' ? datas.ImageBase64 : undefined,
+  )
+  if (captchaId === '' || imageBase64 === '') return undefined
+  return { captchaId, imageBase64 }
+}
 
 /**
  * The enabled-model catalog the gateway serves for the selector.

@@ -17,6 +17,7 @@ import {
   nativeTheme,
   net,
   protocol,
+  safeStorage,
   session,
   shell,
   type IpcMainInvokeEvent,
@@ -59,7 +60,8 @@ import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashRep
 import { mountWelcomeView, type WelcomeSurface } from './welcome-window.ts'
 import { WELCOME_IPC, needsWelcome, type WelcomeLoginInput, type WelcomeNotice } from './welcome-api.ts'
 import { clearLocalSession, localLoginDirectory, loginInitialized, readValidSession, recordGatewaySession, submitLocalLogin } from './local-login.ts'
-import { resolveGatewayConfig, ensureGatewayProfile, loginWithGateway, logoutWithGateway, fetchGatewayModels, readGatewayModelsCache, writeGatewayModelsCache, GATEWAY_CREDENTIAL_REF } from './model-gateway.ts'
+import { resolveGatewayConfig, ensureGatewayProfile, loginWithGateway, logoutWithGateway, fetchGatewayModels, fetchGatewayCaptcha, readGatewayModelsCache, writeGatewayModelsCache, GATEWAY_CREDENTIAL_REF } from './model-gateway.ts'
+import { clearGatewaySessionToken, readGatewaySessionToken, saveGatewaySessionToken } from './gateway-session-token.ts'
 import { trustGatewayCa, writeGatewayCaFile } from './gateway-trust.ts'
 import { connectDesktopWelcome, type DesktopWelcomeBackend } from './welcome-backend.ts'
 import { DesktopUpdateJournal } from './update-journal.ts'
@@ -776,12 +778,17 @@ async function main(): Promise<void> {
     return welcomeBackend.read().then(state => state.hasApiKey).catch(() => true)
   }
   /**
-   * The token minted by this process's last gateway login, kept in memory so
-   * sign-out can call the gateway's logout endpoint. The Host credential store
-   * has no read-back RPC, so after a restart (session remembered, no fresh
-   * login) the value is absent and sign-out falls back to local-only cleanup.
+   * The token minted by this process's last gateway login. Also mirrored under
+   * `<userData>/gateway` via safeStorage so ValidateToken and UserLogout still
+   * work after a restart when the Host credential store has no read-back RPC.
    */
   let gatewaySessionToken: string | undefined
+  const resolveGatewaySessionToken = (): string | undefined => {
+    if (gatewaySessionToken !== undefined) return gatewaySessionToken
+    const stored = readGatewaySessionToken(gatewayModelsDirectory, safeStorage)
+    if (stored !== undefined) gatewaySessionToken = stored
+    return gatewaySessionToken
+  }
   stopForRecovery = () => backend.close()
 
   const reconcileBackend = (): Promise<void> => {
@@ -1462,6 +1469,10 @@ async function main(): Promise<void> {
           return { ok: true }
         },
         loginGate: async () => ({ initialized: gateway !== undefined || loginInitialized(desktopLoginDirectory()) }),
+        fetchCaptcha: async () => {
+          if (gateway === undefined) return undefined
+          return fetchGatewayCaptcha(gateway)
+        },
         submitLogin: async (input: WelcomeLoginInput) => {
           if (gateway === undefined) {
             const result = submitLocalLogin(desktopLoginDirectory(), input)
@@ -1470,7 +1481,15 @@ async function main(): Promise<void> {
             return { ok: true }
           }
           const outcome = await loginWithGateway(gateway, input, { traceDirectory: gatewayModelsDirectory })
-          if (!outcome.ok) return { ok: false, code: outcome.code, detail: outcome.detail }
+          if (!outcome.ok) {
+            return {
+              ok: false,
+              code: outcome.code,
+              detail: outcome.detail,
+              ...outcome.needCaptcha === true ? { needCaptcha: true } : {},
+              ...outcome.locked === true ? { locked: true } : {},
+            }
+          }
           if (welcomeBackend === undefined) {
             return { ok: false, code: 'server', detail: '登录服务暂时不可用，请稍后再试' }
           }
@@ -1481,6 +1500,11 @@ async function main(): Promise<void> {
             return { ok: false, code: 'server', detail: '凭证未保存，请重试' }
           }
           gatewaySessionToken = outcome.token
+          try {
+            saveGatewaySessionToken(gatewayModelsDirectory, outcome.token, safeStorage)
+          } catch (error) {
+            console.error('desktop model gateway: session token was not persisted', error)
+          }
           const catalog = await fetchGatewayModels(gateway, outcome.token).catch(() => undefined)
           if (catalog === undefined) {
             console.warn('desktop model gateway: model catalog unavailable, keeping the built-in model list')
@@ -1552,6 +1576,9 @@ async function main(): Promise<void> {
   ipcMain.handle(DESKTOP_IPC.admit, async (event) => {
     assertProductSender(event)
     if (quitting) return
+    // Keep the original gate: local session + credential presence. Do not call
+    // ValidateToken here — a flaky or buggy session check would force every
+    // launch back to the login card. Expired tokens still surface as 401 on chat.
     if (localSessionActive() && await gatewayCredentialStored()) {
       enteredWorkspace = true
       publishLocalUser()
@@ -1579,8 +1606,9 @@ async function main(): Promise<void> {
   })
   ipcMain.handle(DESKTOP_IPC.localSignOut, async (event) => {
     assertProductSender(event)
-    const sessionToken = gatewaySessionToken
+    const sessionToken = resolveGatewaySessionToken()
     clearLocalSession(desktopLoginDirectory())
+    clearGatewaySessionToken(gatewayModelsDirectory)
     gatewaySessionToken = undefined
     if (gateway !== undefined && sessionToken !== undefined) {
       await logoutWithGateway(gateway, sessionToken).catch(() => false)

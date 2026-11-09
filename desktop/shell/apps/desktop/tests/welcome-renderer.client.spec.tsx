@@ -21,6 +21,7 @@ function mount(initialized = true) {
     saveApiKey: vi.fn(async () => ({ ok: true as const })),
     skip: vi.fn(async () => {}),
     loginGate: vi.fn<() => Promise<WelcomeLoginGate>>().mockResolvedValue({ initialized }),
+    fetchCaptcha: vi.fn(async () => undefined),
     submitLogin: vi.fn<(input: { username: string, password: string, enterpriseKey: string }) => Promise<WelcomeLoginResult>>()
       .mockResolvedValue({ ok: false, code: 'invalid', detail: '用户名或密码错误' }),
   }

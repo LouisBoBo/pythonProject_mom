@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { DEFAULT_ENTERPRISE_KEY, LOGIN_ENTERPRISES } from '../login-enterprises.ts'
-import type { WelcomeApi } from '../welcome-api.ts'
+import type { WelcomeApi, WelcomeCaptcha } from '../welcome-api.ts'
 
 /**
  * Render the enterprise, username, and password card.
@@ -17,6 +17,8 @@ export function Welcome({ api }: { api: WelcomeApi }) {
   const [enterpriseOpen, setEnterpriseOpen] = useState(false)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [captcha, setCaptcha] = useState<WelcomeCaptcha | undefined>(undefined)
+  const [captchaCode, setCaptchaCode] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const busyRef = useRef(false)
@@ -35,6 +37,21 @@ export function Welcome({ api }: { api: WelcomeApi }) {
     return () => { mounted.current = false }
   }, [api, m.welcomeTitle])
 
+  async function refreshCaptcha() {
+    try {
+      const next = await api.fetchCaptcha()
+      if (!mounted.current) return
+      setCaptcha(next)
+      setCaptchaCode('')
+      if (next === undefined) setError('验证码加载失败，请稍后重试')
+    } catch {
+      if (mounted.current) {
+        setCaptcha(undefined)
+        setError('验证码加载失败，请稍后重试')
+      }
+    }
+  }
+
   async function submit(event: FormEvent) {
     event.preventDefault()
     if (busyRef.current) return
@@ -42,16 +59,31 @@ export function Welcome({ api }: { api: WelcomeApi }) {
       setError('请输入账号和密码')
       return
     }
+    if (captcha !== undefined && captchaCode.trim() === '') {
+      setError('请输入验证码')
+      return
+    }
     busyRef.current = true
     setBusy(true)
     setError('')
     try {
-      const result = await api.submitLogin({ username, password, enterpriseKey })
+      const result = await api.submitLogin({
+        username,
+        password,
+        enterpriseKey,
+        ...captcha === undefined ? {} : { captchaId: captcha.captchaId, captchaCode },
+      })
       if (!mounted.current) return
       if (result.ok) {
         setPassword('')
+        setCaptcha(undefined)
+        setCaptchaCode('')
         setInitialized(true)
-      } else setError(result.detail)
+        return
+      }
+      setError(result.detail)
+      if (result.needCaptcha === true) await refreshCaptcha()
+      else if (captcha !== undefined) await refreshCaptcha()
     } catch {
       if (mounted.current) setError('登录失败')
     } finally {
@@ -102,6 +134,17 @@ export function Welcome({ api }: { api: WelcomeApi }) {
           <input type="password" autoComplete={enrolling ? 'new-password' : 'current-password'} placeholder="密码"
             value={password} disabled={busy} onChange={(event) => { setPassword(event.target.value); setError('') }} />
         </label>
+        {captcha !== undefined ? <div className="field captcha-field">
+          <span>验证码</span>
+          <div className="captcha-row">
+            <input type="text" autoComplete="off" placeholder="验证码" value={captchaCode} disabled={busy}
+              onChange={(event) => { setCaptchaCode(event.target.value); setError('') }} />
+            <button type="button" className="captcha-image" disabled={busy} aria-label="刷新验证码"
+              onClick={() => { void refreshCaptcha() }}>
+              <img src={`data:image/png;base64,${captcha.imageBase64}`} alt="验证码" />
+            </button>
+          </div>
+        </div> : null}
         {error !== '' ? <p className="error" role="alert">{error}</p> : null}
         <button className="submit" type="submit" disabled={busy}>{buttonLabel}</button>
       </div>

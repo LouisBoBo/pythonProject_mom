@@ -76,7 +76,7 @@ async function loadWelcomeDocument(document: WelcomeDocument, operations: Welcom
     active = false
     for (const channel of [
       WELCOME_IPC.analyticsEnabled, WELCOME_IPC.analytics, WELCOME_IPC.takeNotice, WELCOME_IPC.saveApiKey,
-      WELCOME_IPC.submitLogin, WELCOME_IPC.loginGate,
+      WELCOME_IPC.submitLogin, WELCOME_IPC.loginGate, WELCOME_IPC.fetchCaptcha,
       WELCOME_IPC.skip, WELCOME_IPC.start, WELCOME_IPC.cancel, WELCOME_IPC.copyLink,
     ]) {
       ipcMain.removeHandler(channel)
@@ -120,8 +120,24 @@ async function loadWelcomeDocument(document: WelcomeDocument, operations: Welcom
     if (typeof record.username !== 'string' || typeof record.password !== 'string' || typeof record.enterpriseKey !== 'string') {
       return { ok: false, code: 'empty', detail: '请输入账号和密码' }
     }
-    const input: WelcomeLoginInput = { username: record.username, password: record.password, enterpriseKey: record.enterpriseKey }
+    const captchaId = typeof record.captchaId === 'string' && record.captchaId.length <= 128
+      ? record.captchaId
+      : undefined
+    const captchaCode = typeof record.captchaCode === 'string' && record.captchaCode.length <= 32
+      ? record.captchaCode
+      : undefined
+    const input: WelcomeLoginInput = {
+      username: record.username,
+      password: record.password,
+      enterpriseKey: record.enterpriseKey,
+      ...captchaId === undefined || captchaId.trim() === '' ? {} : { captchaId },
+      ...captchaCode === undefined || captchaCode.trim() === '' ? {} : { captchaCode },
+    }
     return operations.submitLogin(input)
+  })
+  ipcMain.handle(WELCOME_IPC.fetchCaptcha, async (event) => {
+    assertSender(event)
+    return operations.fetchCaptcha()
   })
   ipcMain.handle(WELCOME_IPC.skip, async (event) => {
     assertSender(event)

@@ -47,6 +47,7 @@ const operations = {
   copySignInLink: async () => undefined,
   saveApiKey: () => Promise.resolve({ ok: true as const }),
   loginGate: async () => ({ initialized: true }),
+  fetchCaptcha: async () => undefined,
   submitLogin: async () => ({ ok: true as const }),
   skip: () => Promise.resolve(),
 }
