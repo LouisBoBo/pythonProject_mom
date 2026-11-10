@@ -54,7 +54,7 @@ import {
   writeDesktopShellSnapshot,
   type DesktopShellSnapshot,
 } from './shell-cache.ts'
-import { bootScriptsChanged, quarantineShadowedRuntimePackages, watchProfilePlugins } from './plugin-visibility.ts'
+import { bootScriptsChanged, quarantineShadowedRuntimePackages, sanitizeProfileManifestBom, watchProfilePlugins } from './plugin-visibility.ts'
 import { DesktopFatalRecovery } from './fatal-recovery.ts'
 import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
 import { mountWelcomeView, type WelcomeSurface } from './welcome-window.ts'
@@ -585,6 +585,10 @@ async function main(): Promise<void> {
       resources, (next) => { platformView.setSession(next) })
     return {
       start: async () => {
+        // PowerShell UTF-8 writes leave a BOM that Host JSON.parse rejects, which leaves a blank window.
+        if (sanitizeProfileManifestBom(paths.profile)) {
+          console.warn('desktop profile: removed UTF-8 BOM from package.json')
+        }
         // Installing a plugin runs pnpm over the whole profile, which can hoist a pinned runtime
         // package next to the installation's own copy and shadow it for every plugin.
         const shadowed = quarantineShadowedRuntimePackages(paths.profile, resources.dsh)

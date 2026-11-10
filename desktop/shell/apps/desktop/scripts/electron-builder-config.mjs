@@ -211,10 +211,20 @@ export function createElectronBuilderConfig(
         await writeMacOSAppUpdateConfig(resourcesDir, resolveMacOSAppUpdateFeed(context.packager.config.publish),
           context.packager.appInfo.updaterCacheDirName)
       }
-      // The bundled runtime declares whichever version prepared it: the product version for an ordinary
-      // release, and a rewritten one for installed-update qualification.
+      // Plugin compatibility follows the harness version recorded while the runtime was prepared.
+      // The Electron product version can be newer. Qualification builds still pass their rewritten version.
+      const runtimeDescriptorPath = join(buildPaths.dsh, 'desktop-runtime.json')
+      let declaredRuntimeVersion
+      if (existsSync(runtimeDescriptorPath)) {
+        try {
+          const version = JSON.parse(readFileSync(runtimeDescriptorPath, 'utf8'))?.release?.version
+          if (typeof version === 'string' && version !== '') declaredRuntimeVersion = version
+        } catch {
+          // verifyDesktopRuntime still runs against preparedRuntimeVersion or productVersion.
+        }
+      }
       await verifyDesktopRuntime(buildPaths.dsh,
-        preparedRuntimeVersion ?? productVersion, { platform: resolvedPlatform, arch: resolvedArch })
+        preparedRuntimeVersion ?? declaredRuntimeVersion ?? productVersion, { platform: resolvedPlatform, arch: resolvedArch })
       // Unsigned Windows builds skip electron-builder's afterSign hook.
       if (packagesWindows && unsigned) await verifyWindowsAsarUnpack(buildPaths.dsh, resourcesDir, windowsCode)
     },

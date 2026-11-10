@@ -1,8 +1,42 @@
 /** Apply an installed plugin to the already-open desktop window. */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, watch, type FSWatcher } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, watch, writeFileSync, type FSWatcher } from 'node:fs'
 import { join } from 'node:path'
 import { shellScriptKeys } from './shell-cache.ts'
+
+/**
+ * Remove a UTF-8 BOM from the profile `package.json` if one is present.
+ * Windows editors and PowerShell `Set-Content -Encoding utf8` often write EF BB BF;
+ * Host `JSON.parse` rejects that and the desktop window stays blank.
+ * Skips while `package.json.lock` is held so a concurrent pnpm write is not clobbered.
+ * @param profileDir - Desktop profile directory.
+ * @returns true when a BOM was stripped.
+ */
+export function sanitizeProfileManifestBom(profileDir: string): boolean {
+  const path = join(profileDir, 'package.json')
+  if (existsSync(join(profileDir, 'package.json.lock'))) return false
+  let bytes: Buffer
+  try { bytes = readFileSync(path) } catch { return false }
+  if (bytes.length < 3 || bytes[0] !== 0xEF || bytes[1] !== 0xBB || bytes[2] !== 0xBF) return false
+  const body = bytes.subarray(3)
+  let parsed: unknown
+  try { parsed = JSON.parse(body.toString('utf8')) } catch { return false }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false
+  const temporary = `${path}.tmp`
+  writeFileSync(temporary, body)
+  try {
+    renameSync(temporary, path)
+  } catch {
+    try {
+      rmSync(path, { force: true })
+      renameSync(temporary, path)
+    } catch {
+      rmSync(temporary, { force: true })
+      return false
+    }
+  }
+  return true
+}
 
 /**
  * Plugins the profile has saved. The market shows these as installed even
@@ -12,7 +46,7 @@ import { shellScriptKeys } from './shell-cache.ts'
  */
 export function profilePluginSignature(packageJson: string): string | undefined {
   let parsed: unknown
-  try { parsed = JSON.parse(packageJson) } catch { return undefined }
+  try { parsed = JSON.parse(packageJson.replace(/^\uFEFF/u, '')) } catch { return undefined }
   if (typeof parsed !== 'object' || parsed === null) return undefined
   const manifest = parsed as { dependencies?: unknown, dsh?: { profile?: { bundles?: unknown } } }
   const dependencies = manifest.dependencies

@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -29,6 +29,32 @@ function readPin(path) {
     pin[line.slice(0, index).trim()] = line.slice(index + 1).trim()
   }
   return pin
+}
+
+function allowDesktopProductVersion(buildRoot) {
+  const path = join(buildRoot, 'scripts', 'release', 'families.ts')
+  const text = readFileSync(path, 'utf8')
+  const lf = text.replace(/\r\n/gu, '\n')
+  if (lf.includes("member.directory !== 'apps/desktop'")) return
+  const needle = [
+    '    const versions = new Set(members.map(member => member.version))',
+    '    if (versions.size !== 1) {',
+    '      const detail = members.map(member => `${member.directory}: ${member.version}`).join(\'\\n\')',
+    '      throw new Error(`dsh release members must share one version:\\n${detail}`)',
+    '    }',
+  ].join('\n')
+  const replacement = [
+    "    const shared = members.filter(member => member.directory !== 'apps/desktop')",
+    '    const versions = new Set(shared.map(member => member.version))',
+    '    if (versions.size !== 1) {',
+    '      const detail = shared.map(member => `${member.directory}: ${member.version}`).join(\'\\n\')',
+    '      throw new Error(`dsh release members must share one version:\\n${detail}`)',
+    '    }',
+  ].join('\n')
+  if (!lf.includes(needle)) fail('could not patch the dsh family version check')
+  const patched = lf.replace(needle, replacement)
+  writeFileSync(path, text.includes('\r\n') ? patched.replace(/\n/gu, '\r\n') : patched)
+  console.log('desktop product version stays independent of the dsh runtime')
 }
 
 function applyOnMac(buildRoot, productRoot) {
@@ -63,6 +89,7 @@ function applyOnMac(buildRoot, productRoot) {
     copyFileSync(source, target)
   }
   console.log(`apply ok, ${paths.length} files. Source of truth: ${overlay}`)
+  allowDesktopProductVersion(buildRoot)
 }
 
 const buildRoot = process.env.DSH_BUILD_ROOT
@@ -80,7 +107,9 @@ if (process.platform === 'win32') {
   const sync = join(productRoot, 'desktop', 'shell-sync.ps1')
   if (!existsSync(sync)) fail(`desktop package: missing ${sync}`)
   const result = spawnSync('powershell', ['-NoProfile', '-File', sync, '-Mode', 'apply'], { stdio: 'inherit' })
-  process.exit(result.status === null ? 1 : result.status)
+  if (result.status !== 0) process.exit(result.status === null ? 1 : result.status)
+  allowDesktopProductVersion(buildRoot)
+  process.exit(0)
 }
 
 applyOnMac(buildRoot, productRoot)

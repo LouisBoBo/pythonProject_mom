@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { bootScriptsChanged, profilePluginSignature, quarantineShadowedRuntimePackages, watchProfilePlugins } from '../src/plugin-visibility.ts'
+import { bootScriptsChanged, profilePluginSignature, quarantineShadowedRuntimePackages, sanitizeProfileManifestBom, watchProfilePlugins } from '../src/plugin-visibility.ts'
 
 const directories: string[] = []
 
@@ -41,6 +41,35 @@ describe('profile plugin signature', () => {
     expect(bootScriptsChanged(undefined, added)).toBe(false)
     expect(bootScriptsChanged(booted, same)).toBe(false)
     expect(bootScriptsChanged(booted, added)).toBe(true)
+  })
+})
+
+describe('profile manifest BOM', () => {
+  it('strips a UTF-8 BOM so Host JSON.parse can read package.json', () => {
+    const directory = profile()
+    const path = join(directory, 'package.json')
+    const body = `${JSON.stringify({ name: 'dsh-profile-desktop', private: true }, undefined, 2)}\n`
+    writeFileSync(path, Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(body, 'utf8')]))
+    expect(() => JSON.parse(readFileSync(path, 'utf8'))).toThrow(/Unexpected token/)
+
+    expect(sanitizeProfileManifestBom(directory)).toBe(true)
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ name: 'dsh-profile-desktop', private: true })
+    expect(sanitizeProfileManifestBom(directory)).toBe(false)
+  })
+
+  it('leaves a locked or non-object BOM file alone', () => {
+    const directory = profile()
+    const path = join(directory, 'package.json')
+    const body = `${JSON.stringify({ name: 'dsh-profile-desktop' }, undefined, 2)}\n`
+    writeFileSync(path, Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(body, 'utf8')]))
+    writeFileSync(join(directory, 'package.json.lock'), '1\n')
+    expect(sanitizeProfileManifestBom(directory)).toBe(false)
+    expect(readFileSync(path)[0]).toBe(0xEF)
+
+    rmSync(join(directory, 'package.json.lock'))
+    writeFileSync(path, Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from('[]\n', 'utf8')]))
+    expect(sanitizeProfileManifestBom(directory)).toBe(false)
+    expect(readFileSync(path)[0]).toBe(0xEF)
   })
 })
 

@@ -42,13 +42,19 @@ export function normalizeEnterpriseCid(raw: string | undefined): string {
 }
 
 /**
+ * String environment map. This file is also typechecked by the client build,
+ * which does not load `@types/node`, so the map stays structural.
+ */
+type EnterpriseEnv = { readonly [key: string]: string | undefined }
+
+/**
  * Resolve the enterprise CID for a login-card key.
  * Environment overrides win so ops can stamp CIDs without a rebuild.
  * @param key - card enterprise key.
  * @param env - process environment.
  * @returns the decimal CID, or empty while unmapped.
  */
-export function enterpriseCid(key: string, env: NodeJS.ProcessEnv = process.env): string {
+export function enterpriseCid(key: string, env: EnterpriseEnv = process.env): string {
   const normalized = normalizeEnterpriseKey(key)
   const fromEnv = normalizeEnterpriseCid(env[ENTERPRISE_CID_ENV[normalized]])
   if (fromEnv !== '') return fromEnv
