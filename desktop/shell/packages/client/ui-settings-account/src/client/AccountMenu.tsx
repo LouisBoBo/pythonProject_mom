@@ -46,26 +46,6 @@ function useDesktopAppVersion(): string | undefined {
   return version
 }
 
-const AVATAR_BACKGROUND_KEY = 'dsh.local-avatar-background'
-const DEFAULT_AVATAR_BACKGROUND = '#1f9d55'
-
-function readAvatarBackground(): string {
-  try {
-    const value = localStorage.getItem(AVATAR_BACKGROUND_KEY)
-    return value !== null && /^#[0-9a-fA-F]{6}$/.test(value) ? value.toLowerCase() : DEFAULT_AVATAR_BACKGROUND
-  } catch {
-    return DEFAULT_AVATAR_BACKGROUND
-  }
-}
-
-function avatarInk(background: string): string {
-  const hex = background.slice(1)
-  const red = Number.parseInt(hex.slice(0, 2), 16)
-  const green = Number.parseInt(hex.slice(2, 4), 16)
-  const blue = Number.parseInt(hex.slice(4, 6), 16)
-  return (0.299 * red + 0.587 * green + 0.114 * blue) / 255 > 0.62 ? '#0f1115' : '#ffffff'
-}
-
 /** The desktop shell's platform login, when this page is running inside it. */
 function useDesktopLocalUser(): DesktopLocalUser | null {
   const api = (globalThis as { dshLocalSession?: DesktopLocalSession }).dshLocalSession
@@ -112,14 +92,6 @@ export function AccountMenu({
     ? profile.value.name ?? profile.value.contact ?? t('signedIn') : t('signedIn')
   const label = localUser?.displayName ?? deepseekLabel
   const [open, setOpen] = useState(false)
-  const [avatarBackground, setAvatarBackground] = useState(DEFAULT_AVATAR_BACKGROUND)
-  useEffect(() => { setAvatarBackground(readAvatarBackground()) }, [])
-  const chooseAvatarBackground = (value: string): void => {
-    if (!/^#[0-9a-fA-F]{6}$/.test(value)) return
-    const next = value.toLowerCase()
-    setAvatarBackground(next)
-    try { localStorage.setItem(AVATAR_BACKGROUND_KEY, next) } catch { /* the color is only a visual preference */ }
-  }
   const trigger = useRef<HTMLButtonElement>(null)
   const [busy, setBusy] = useState(false)
   const [signOutImpact, setSignOutImpact] = useState<boolean | 'unknown'>()
@@ -142,8 +114,7 @@ export function AccountMenu({
       anchor={<button ref={trigger} type="button" className={css.trigger} data-collapsed={!wide} data-signed-out={!signedIn} aria-label={t('menu')}
         aria-haspopup="menu" aria-expanded={open} onClick={() => { setOpen(value => !value) }}>
         {signedIn
-          ? <span className={css.avatar} data-avatar-status={localUser === null ? account.avatar?.status : 'local'}
-            style={localUser === null ? undefined : { background: avatarBackground, color: avatarInk(avatarBackground) }}>
+          ? <span className={css.avatar} data-avatar-status={localUser === null ? account.avatar?.status : 'local'}>
             {localUser === null
               ? <AccountAvatar avatar={account.avatar} avatarFailed={avatarFailed} />
               : localUser.displayName.slice(0, 1).toUpperCase()}
@@ -160,11 +131,6 @@ export function AccountMenu({
         ...(signedIn ? [{ id: 'signout', label: t('signOut'), icon: <LogoutIcon />, disabled: busy }]
           : [{ id: 'signin', label: t('signIn'), icon: <IconUserOutlineMedium size={16} /> }]),
       ]}
-      {...(localUser === null ? {} : { children: <label className={css.avatarColor}>
-        背景色
-        <input type="color" aria-label="头像背景色" value={avatarBackground}
-          onChange={(event) => { chooseAvatarBackground(event.target.value) }} />
-      </label> })}
       onClose={() => { setOpen(false) }}
       onSelect={(id) => {
         if (id === 'settings') { setOpen(false); trigger.current?.focus(); openSettings() }

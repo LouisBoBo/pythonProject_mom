@@ -5,12 +5,9 @@
 .trigger:hover { background: var(--dsw-alias-interactive-bg-hover); }
 .avatar { display: flex; align-items: center; justify-content: center; flex: none; width: 24px; height: 24px; border-radius: 50%;
   corner-shape: round; background: var(--dsw-alias-bg-skeleton); color: var(--dsw-alias-label-tertiary); }
-.avatar[data-avatar-status='local'] { width: 32px; height: 32px; background: #1f9d55; color: #fff; font-size: 15px; font-weight: 600; line-height: 1; }
+.avatar[data-avatar-status='local'] { width: 32px; height: 32px; background: #1aa6a6; color: #fff; font-size: 15px; font-weight: 600; line-height: 1; }
 .trigger[data-collapsed='true'] .avatar[data-avatar-status='local'] { width: 28px; height: 28px; font-size: 14px; }
-.avatarColor { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 4px 0; padding: 8px 10px;
-  border-top: 0.5px solid var(--dsw-alias-border-secondary, rgba(15, 17, 21, 0.08)); color: var(--dsw-alias-label-secondary); font-size: 13px; line-height: 20px; }
 .appVersion { margin-left: 8px; color: var(--dsw-alias-label-tertiary); font-size: 12px; }
-.avatarColor input { width: 28px; height: 28px; padding: 0; border: 0; background: transparent; cursor: pointer; }
 .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Signed-out launcher: a 32px More row carrying the 14px ellipsis. */
 .trigger[data-signed-out='true']:not([data-collapsed='true']) { height: 32px; padding: 6px 2px 6px 6px; line-height: 20px; }
