@@ -51,49 +51,19 @@
 
 ### 任务 2：弱 ValidateToken（不挡进工作区）
 
-**文件：**
-- 修改：`desktop/shell/apps/desktop/src/main.ts`（admit 附近）
-- 修改/测试：`desktop/shell/apps/desktop/tests/main-startup.spec.ts` 或现有 gateway 测
-
-**约束：**
-- admit 条件仍是：`localSessionActive && gatewayCredentialStored`
-- ValidateToken 失败只打日志 / 可选清坏 token，**绝不**因此把用户拦回登录卡
-- 成功路径零行为变化
-
-- [ ] **步骤 1：写失败测试** — admit 在 token 校验失败时仍 resolve true（或现有 admit 语义）
-- [ ] **步骤 2：实现旁路探测**
-- [ ] **步骤 3：跑 `main-startup` / `welcome` / `model-gateway` 相关测**
-- [ ] **步骤 4：Commit**
-
----
+- [x] 2026-11-11 完成：`softValidateStoredGatewayToken` + admit 旁路；welcome/gateway 相关 40/40
 
 ### 任务 3：强制升级策略可配置验收
 
-**文件：** 现有 `mandatory-update-policy.ts` / 测试；必要时补文档说明
-
-**约束：** 不改默认升级行为；只补齐「策略配置可读、测试覆盖、差距文档勾选」。
-
-- [ ] **步骤 1：盘点现有 policy 测试是否已覆盖强制/可选**
-- [ ] **步骤 2：缺口补测，不改生产默认**
-- [ ] **步骤 3：Commit**
-
----
+- [x] 2026-11-11 完成：现有 policy 测试 69/69 通过；不改生产默认；差距文档勾选
 
 ### 任务 4：Agent 工具策略（最小钩子）
 
-**范围收紧：** 仅增加只读配置项与默认「不改变现网行为」的钩子；不做完整策略中心 UI。
-
-- [ ] **步骤 1：确认现有工具/skill 入口是否已有 deny/allow 点**
-- [ ] **步骤 2：若无低风险挂点则本任务降级为文档「需插件侧配合」并跳过代码**
-- [ ] **步骤 3：有挂点则加默认放行的配置解析 + 单测**
-- [ ] **步骤 4：Commit**
-
----
+- [x] 2026-11-11 降级：已有 permission preset；企业白名单待产品定策，本轮不改默认工具权限
 
 ### 任务 5：更新差距评估文档
 
-- [ ] 勾选清单 #5；刷新「本仓库现在就能改」表；注明验证命令与日期
-- [ ] Commit
+- [x] 2026-11-11：清单 #5/#8–#11 与「可改」表已更新
 
 ---
 
