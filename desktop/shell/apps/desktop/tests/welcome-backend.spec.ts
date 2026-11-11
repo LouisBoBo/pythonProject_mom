@@ -59,6 +59,21 @@ describe('welcome backend credentials', () => {
     })
   })
 
+  it('saveRef only accepts identifier-shaped refs and bounded printable secrets', async () => {
+    const { calls, send } = harness()
+    const backend = await connect(send)
+
+    expect(await backend.saveRef('../evil', 'sk-ok')).toEqual({ ok: false })
+    expect(await backend.saveRef('bad ref', 'sk-ok')).toEqual({ ok: false })
+    expect(await backend.saveRef('DEEPSEEK_API_KEY', 'sk-ok')).toEqual({ ok: true })
+    expect(await backend.saveRef('DEEPSEEK_API_KEY', `sk-${'x'.repeat(520)}`)).toEqual({ ok: false })
+    expect(calls).toContainEqual({
+      method: 'credentials/set',
+      args: { ref: 'DEEPSEEK_API_KEY', value: 'sk-ok' },
+    })
+    expect(calls.filter(call => call.method === 'credentials/set')).toHaveLength(1)
+  })
+
   it('removes that same token so a signed-out app keeps no credential', async () => {
     const { calls, send } = harness()
     const backend = await connect(send)

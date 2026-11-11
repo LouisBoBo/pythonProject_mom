@@ -9,7 +9,7 @@ const electron = vi.hoisted(() => ({
   handlers: new Map<string, (event: unknown, value?: unknown, attributes?: unknown) => Promise<unknown>>(),
 }))
 vi.mock('electron', () => ({
-  app: { getAppPath: () => electron.root },
+  app: { getAppPath: () => electron.root, isPackaged: false },
   BrowserWindow: vi.fn(function (options: unknown) { return electron.create(options) }),
   ipcMain: {
     handle: (name: string, handler: (event: unknown, value?: unknown, attributes?: unknown) => Promise<unknown>) => {
@@ -60,6 +60,7 @@ describe('desktop welcome window', () => {
       resizable: false, maximizable: false, fullscreenable: false,
       webPreferences: {
         nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true,
+        devTools: true,
         additionalArguments: ['--dsh-welcome-locale=zh-CN'],
       },
     })

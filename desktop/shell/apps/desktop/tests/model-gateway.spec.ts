@@ -20,8 +20,16 @@ import {
   parseGatewayBaseUrl,
   parseTokenExpires,
   readGatewayModelsCache,
+  applyProjectGatewayDesktopEnv,
+  clearGatewayProfile,
+  readDotEnvValue,
+  readGatewayDesktopEnvFromDotEnv,
+  readProjectPersonalModelApiKey,
   resolveGatewayConfig,
+  resolveGatewayDesktopEnv,
+  stripGatewayPatchBlock,
   stripLlmRetryBlock,
+  usesPersonalModelKey,
   softValidateStoredGatewayToken,
   validateGatewayToken,
   writeGatewayModelsCache,
@@ -118,6 +126,70 @@ it('stays off without a URL and reads the environment first', () => {
 
 it('falls back to the company server when no URL is configured', () => {
   expect(resolveGatewayConfig({})).toMatchObject({ baseUrl: 'http://113.90.149.166:11231' })
+})
+
+it('treats only DSH_DESKTOP_GATEWAY_ENV=dev as personal-model mode', () => {
+  expect(resolveGatewayDesktopEnv({})).toBe('prod')
+  expect(resolveGatewayDesktopEnv({ DSH_DESKTOP_GATEWAY_ENV: 'prod' })).toBe('prod')
+  expect(resolveGatewayDesktopEnv({ DSH_DESKTOP_GATEWAY_ENV: 'DEV' })).toBe('dev')
+  expect(resolveGatewayDesktopEnv({ DSH_DESKTOP_GATEWAY_ENV: ' staging ' })).toBe('prod')
+})
+
+it('keeps the company gateway URL in dev so login still uses company UserLogin', () => {
+  expect(usesPersonalModelKey({ DSH_DESKTOP_GATEWAY_ENV: 'dev' })).toBe(true)
+  expect(usesPersonalModelKey({ DSH_DESKTOP_GATEWAY_ENV: 'prod' })).toBe(false)
+  expect(resolveGatewayConfig({ DSH_DESKTOP_GATEWAY_ENV: 'dev' })).toMatchObject({
+    baseUrl: 'http://113.90.149.166:11231',
+  })
+})
+
+it('reads only named keys from a project .env body', () => {
+  const body = [
+    '# comment',
+    'DEEPSEEK_API_KEY=sk-secret',
+    'DSH_DESKTOP_GATEWAY_ENV=dev',
+    'OTHER=1',
+  ].join('\n')
+  expect(readGatewayDesktopEnvFromDotEnv(body)).toBe('dev')
+  expect(readDotEnvValue(body, 'DEEPSEEK_API_KEY')).toBe('sk-secret')
+  expect(readGatewayDesktopEnvFromDotEnv('export DSH_DESKTOP_GATEWAY_ENV="prod"\n')).toBe('prod')
+  expect(readGatewayDesktopEnvFromDotEnv('DEEPSEEK_API_KEY=sk-secret\n')).toBeUndefined()
+})
+
+it('applies project .env gateway mode only when the process env does not already set it', () => {
+  const root = directory()
+  const envFile = join(root, '.env')
+  writeFileSync(envFile, 'DSH_DESKTOP_GATEWAY_ENV=dev\nDEEPSEEK_API_KEY=sk-secret\n')
+  const fresh: NodeJS.ProcessEnv = {}
+  expect(applyProjectGatewayDesktopEnv(fresh, [envFile])).toBe(true)
+  expect(fresh.DSH_DESKTOP_GATEWAY_ENV).toBe('dev')
+  expect(fresh.DEEPSEEK_API_KEY).toBeUndefined()
+  expect(readProjectPersonalModelApiKey([envFile])).toBe('sk-secret')
+  const locked: NodeJS.ProcessEnv = { DSH_DESKTOP_GATEWAY_ENV: 'prod' }
+  expect(applyProjectGatewayDesktopEnv(locked, [envFile])).toBe(false)
+  expect(locked.DSH_DESKTOP_GATEWAY_ENV).toBe('prod')
+})
+
+it('lets ZR_MODEL_GATEWAY_URL override the company origin including forcing the gateway off', () => {
+  expect(resolveGatewayConfig({
+    DSH_DESKTOP_GATEWAY_ENV: 'dev',
+    ZR_MODEL_GATEWAY_URL: 'http://localhost:9000',
+  })).toMatchObject({ baseUrl: 'http://localhost:9000' })
+  expect(resolveGatewayConfig({
+    DSH_DESKTOP_GATEWAY_ENV: 'prod',
+    ZR_MODEL_GATEWAY_URL: '',
+  })).toBeUndefined()
+})
+
+it('strips a leftover gateway profile block when the gateway is off', () => {
+  const root = directory()
+  writeFileSync(join(root, 'cordis.patch.yml'), `${gatewayPatchBlock(config)}\n- id: keep-me\n`)
+  clearGatewayProfile(root)
+  const written = readFileSync(join(root, 'cordis.patch.yml'), 'utf8')
+  expect(written).not.toContain('zr-model-gateway:begin')
+  expect(written).not.toContain('llm-deepseek')
+  expect(written).toContain('- id: keep-me')
+  expect(stripGatewayPatchBlock('no markers')).toBe('no markers')
 })
 
 it('ignores an unusable URL instead of failing startup', () => {
@@ -418,9 +490,13 @@ it('never surfaces transport or payload details', async () => {
   expect(trace).toContain('ECONNREFUSED')
   expect(trace).toContain('/api/sys/user/UserLogin')
   expect(trace).not.toContain(input.password)
+  expect(trace).not.toContain(input.username)
   expect(describeGatewayLoginAttempt('http://g/api/sys/user/UserLogin', { UserName: 'a', Password: 'x'.repeat(16) }, {
     ok: false, ms: 1, error: 'TypeError: fetch failed',
   })).toContain('passwordChars":16')
+  expect(describeGatewayLoginAttempt('http://g/api/sys/user/UserLogin', { UserName: 'secret-user', Password: 'x'.repeat(16) }, {
+    ok: false, ms: 1, error: 'TypeError: fetch failed',
+  })).not.toContain('secret-user')
   error.mockRestore()
 
   const brokenJson: GatewayFetch = async () => ({

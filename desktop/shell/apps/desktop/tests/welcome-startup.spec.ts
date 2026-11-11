@@ -132,6 +132,7 @@ vi.mock('../src/welcome-backend.ts', () => ({
       return { loggedIn: false, hasApiKey: state.hasApiKey, writable: true, localePreference: state.preference }
     },
     save: async () => ({ ok: true }),
+    saveRef: async () => ({ ok: true }),
     account: {
       watch: (listener: (value: AccountView) => void, _failed: () => void, expired: () => void) => {
         state.accountListener = listener
@@ -204,6 +205,8 @@ it.each([false, true])('starts welcome onboarding without carrying update focus 
   vi.stubEnv('DSH_DESKTOP_OPEN_DEVTOOLS', '0')
   vi.stubEnv('DSH_DESKTOP_MANDATORY_UPDATE_CONFIG', undefined)
   vi.stubEnv('DSH_DESKTOP_UPDATE_JOURNAL_DIR', undefined)
+  // Empty string disables the built-in gateway so this case exercises API-key onboarding + skip.
+  vi.stubEnv('ZR_MODEL_GATEWAY_URL', '')
   const reading = Promise.withResolvers<undefined>()
   const loading = Promise.withResolvers<undefined>()
   state.beforeRead.mockReturnValueOnce(reading.promise)
@@ -343,4 +346,40 @@ it.each([false, true])('starts welcome onboarding without carrying update focus 
   expect(state.showWorkspace).toHaveBeenCalledOnce()
   expect(state.focusWorkspace).toHaveBeenCalledOnce()
 
+})
+
+it('rejects welcome skip when the enterprise gateway is configured', async () => {
+  vi.resetModules()
+  vi.clearAllMocks()
+  state.preference = 'zh'
+  state.hasApiKey = false
+  state.operations = undefined
+  state.accountState.mockResolvedValue({ status: 'signed-out', attempt: null, links: { usageUrl: '', topUpUrl: '' } })
+  vi.useFakeTimers()
+  vi.stubEnv('DSH_CLIENT_VERSION', '1.2.3')
+  vi.stubEnv('DSH_DESKTOP_DEV_PROJECT_DIR', '/development-profile')
+  vi.stubEnv('DSH_DESKTOP_NODE_BINARY', '/runtime/node')
+  vi.stubEnv('DSH_DESKTOP_PNPM_ENTRY', '/runtime/pnpm')
+  vi.stubEnv('DSH_DESKTOP_DSH_DIR', '/runtime/dsh')
+  vi.stubEnv('DSH_DESKTOP_PRIMARY_RUNTIME_DIR', '/runtime/primary-runtime')
+  vi.stubEnv('DSH_DESKTOP_HOST_INSPECT_PORT', undefined)
+  vi.stubEnv('DSH_DESKTOP_OPEN_DEVTOOLS', '0')
+  vi.stubEnv('DSH_DESKTOP_MANDATORY_UPDATE_CONFIG', undefined)
+  vi.stubEnv('DSH_DESKTOP_UPDATE_JOURNAL_DIR', undefined)
+  vi.stubEnv('ZR_MODEL_GATEWAY_URL', 'https://gateway.example')
+  const reading = Promise.withResolvers<undefined>()
+  const loading = Promise.withResolvers<undefined>()
+  state.beforeRead.mockReturnValueOnce(reading.promise)
+  state.beforeWelcome.mockReturnValueOnce(loading.promise)
+  await import('../src/main.ts')
+  await vi.waitFor(() => { expect(state.beforeRead).toHaveBeenCalledOnce() })
+  reading.resolve(undefined)
+  const contents = state.contents as { mainFrame: { url: string }; send: ReturnType<typeof vi.fn> }
+  const event = { sender: contents, senderFrame: contents.mainFrame }
+  void state.handlers.get(DESKTOP_IPC.admit)!(event)
+  await vi.waitFor(() => { expect(state.beforeWelcome).toHaveBeenCalledOnce() })
+  loading.resolve(undefined)
+  await vi.waitFor(() => { expect(state.operations).toBeDefined() })
+  for (let step = 0; step < 8; step += 1) await Promise.resolve()
+  await expect(state.operations!.skip()).rejects.toThrow('skip disabled for gateway login')
 })

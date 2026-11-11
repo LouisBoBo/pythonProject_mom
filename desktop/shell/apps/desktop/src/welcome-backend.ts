@@ -29,6 +29,10 @@ export interface DesktopWelcomeBackend {
    */
   save(apiKey: string): Promise<{ ok: boolean }>
   /**
+   * Store under an explicit ref (e.g. personal `DEEPSEEK_API_KEY` while login uses the gateway token ref).
+   */
+  saveRef(ref: string, apiKey: string): Promise<{ ok: boolean }>
+  /**
    * Remove the stored key, so a signed-out app keeps no credential the next launch could use.
    * @returns A safe removal outcome without provider diagnostics.
    */
@@ -168,6 +172,18 @@ export async function connectDesktopWelcome(
         return { ok: true }
       } catch {
         // Provider diagnostics may contain credentials; the native form owns failure copy.
+        return { ok: false }
+      }
+    },
+    async saveRef(ref, apiKey) {
+      // Allowlist-shaped refs only: never accept path-like or whitespace names into the credential store.
+      const name = ref.trim()
+      if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name)) return { ok: false }
+      if (!/^[\x21-\x7e]+$/.test(apiKey) || apiKey.length > 512) return { ok: false }
+      try {
+        await invoke({ namespace: 'credentials', method: 'set', args: { ref: name, value: apiKey } })
+        return { ok: true }
+      } catch {
         return { ok: false }
       }
     },

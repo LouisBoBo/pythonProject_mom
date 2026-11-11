@@ -8,16 +8,31 @@
 
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join, resolve as resolvePath } from 'node:path'
 import { enterpriseCid, normalizeEnterpriseKey } from './login-enterprises.ts'
 import { SESSION_TTL_MS } from './local-login.ts'
 
 /**
- * Deployment address, used when `ZR_MODEL_GATEWAY_URL` is absent.
- * Set this in a build with a fixed gateway; leave empty to keep the feature off.
+ * Production (company) MOM gateway origin (login always; chat only in `prod`).
+ * Used when `ZR_MODEL_GATEWAY_URL` is absent. `dev` still uses this for UserLogin.
  * The company server currently serves plain HTTP only (no TLS listener).
  */
 export const DEFAULT_GATEWAY_BASE_URL = 'http://113.90.149.166:11231'
+
+/**
+ * Desktop mode switch (`DSH_DESKTOP_GATEWAY_ENV` in project `.env` or the process env).
+ *
+ * - unset / `prod` (default): company UserLogin + company model gateway (unchanged).
+ * - `dev`: **same company UserLogin**, but model calls use a personal `DEEPSEEK_API_KEY`
+ *   (no `zr-gateway` chat route). Only the model path changes.
+ *
+ * Explicit `ZR_MODEL_GATEWAY_URL` still overrides the login/gateway base URL
+ * (including `""` to force the gateway fully off).
+ */
+export const GATEWAY_DESKTOP_ENV_KEY = 'DSH_DESKTOP_GATEWAY_ENV'
+
+/** Official DeepSeek credential / env name used when {@link usesPersonalModelKey} is true. */
+export const PERSONAL_MODEL_API_KEY_ENV = 'DEEPSEEK_API_KEY'
 
 /** pi-ai route name requests select; also the prefix of every alias. */
 export const GATEWAY_PROVIDER = 'zr-gateway'
@@ -195,9 +210,142 @@ function isLoopbackHost(hostname: string): boolean {
 }
 
 /**
+ * Read {@link GATEWAY_DESKTOP_ENV_KEY}. Only the exact value `dev` (any case) selects
+ * personal-model mode; every other value stays `prod` so typos cannot drop the company chat route.
+ */
+export function resolveGatewayDesktopEnv(env: NodeJS.ProcessEnv = process.env): 'dev' | 'prod' {
+  return (env[GATEWAY_DESKTOP_ENV_KEY] ?? '').trim().toLowerCase() === 'dev' ? 'dev' : 'prod'
+}
+
+/** `dev` → company login stays; models use {@link PERSONAL_MODEL_API_KEY_ENV} instead of `zr-gateway`. */
+export function usesPersonalModelKey(env: NodeJS.ProcessEnv = process.env): boolean {
+  return resolveGatewayDesktopEnv(env) === 'dev'
+}
+
+/**
+ * Read one KEY=value from a `.env` body. Does not load the rest of the file into the process.
+ */
+export function readDotEnvValue(text: string, key: string): string | undefined {
+  const pattern = new RegExp(`^(?:export\\s+)?${key.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}\\s*=\\s*(.*)$`, 'u')
+  for (const line of text.split(/\r?\n/u)) {
+    const trimmed = line.trim()
+    if (trimmed === '' || trimmed.startsWith('#')) continue
+    const match = pattern.exec(trimmed)
+    if (match === null) continue
+    let value = (match[1] ?? '').trim()
+    if (
+      (value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1)
+    }
+    return value
+  }
+  return undefined
+}
+
+/** @deprecated Use {@link readDotEnvValue} — kept name for existing tests. */
+export function readGatewayDesktopEnvFromDotEnv(text: string): string | undefined {
+  return readDotEnvValue(text, GATEWAY_DESKTOP_ENV_KEY)
+}
+
+/**
+ * Candidate project `.env` paths: cwd, ancestors, and the path in a `.dsh-mom-root` marker
+ * (written by `desktop/prepare-windows.ps1` into `C:\\dsh-src`).
+ */
+export function projectGatewayEnvFileCandidates(
+  cwd: string = process.cwd(),
+  fromFile?: string,
+): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  const add = (path: string): void => {
+    const normalized = resolvePath(path)
+    if (seen.has(normalized)) return
+    seen.add(normalized)
+    out.push(normalized)
+  }
+  const roots = [cwd]
+  if (fromFile !== undefined) roots.push(dirname(fromFile))
+  for (const start of roots) {
+    let directory = resolvePath(start)
+    for (let depth = 0; depth < 8; depth += 1) {
+      const marker = join(directory, '.dsh-mom-root')
+      if (existsSync(marker)) {
+        try {
+          const root = readFileSync(marker, 'utf8').trim().split(/\r?\n/u)[0]?.trim()
+          if (root !== undefined && root !== '') add(join(root, '.env'))
+        } catch {
+          // ignore unreadable marker
+        }
+      }
+      add(join(directory, '.env'))
+      const parent = dirname(directory)
+      if (parent === directory) break
+      directory = parent
+    }
+  }
+  return out
+}
+
+/**
+ * If the process does not already define {@link GATEWAY_DESKTOP_ENV_KEY}, copy it from the
+ * first readable project `.env`. Returns true when a value was applied.
+ */
+export function applyProjectGatewayDesktopEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  filePaths: readonly string[] = projectGatewayEnvFileCandidates(),
+): boolean {
+  if (env[GATEWAY_DESKTOP_ENV_KEY] !== undefined) return false
+  for (const path of filePaths) {
+    if (!existsSync(path)) continue
+    let text: string
+    try {
+      text = readFileSync(path, 'utf8')
+    } catch {
+      continue
+    }
+    const value = readGatewayDesktopEnvFromDotEnv(text)
+    if (value === undefined) continue
+    env[GATEWAY_DESKTOP_ENV_KEY] = value
+    return true
+  }
+  return false
+}
+
+/**
+ * Read {@link PERSONAL_MODEL_API_KEY_ENV} from the first project `.env` that defines it.
+ * Used only when {@link usesPersonalModelKey} is true; never invents a key.
+ */
+export function readProjectPersonalModelApiKey(
+  filePaths: readonly string[] = projectGatewayEnvFileCandidates(),
+): string | undefined {
+  for (const path of filePaths) {
+    if (!existsSync(path)) continue
+    let text: string
+    try {
+      text = readFileSync(path, 'utf8')
+    } catch {
+      continue
+    }
+    const value = readDotEnvValue(text, PERSONAL_MODEL_API_KEY_ENV)?.trim()
+    if (value !== undefined && value !== '') return value
+  }
+  return undefined
+}
+
+/**
  * Resolve the gateway from the environment, falling back to the build constant.
+ *
+ * Priority (minimal / safe):
+ * 1. `ZR_MODEL_GATEWAY_URL` when the variable is present (empty string disables the gateway)
+ * 2. `fallback` (defaults to the company production origin)
+ *
+ * `DSH_DESKTOP_GATEWAY_ENV=dev` does **not** clear this URL: login still uses the company
+ * gateway; only the Host model route is switched via {@link usesPersonalModelKey}.
+ *
  * @param env - process environment.
- * @param fallback - deployment address used when the environment has none.
+ * @param fallback - production address used when env has no URL.
  * @returns the gateway, or undefined when this build has none.
  */
 export function resolveGatewayConfig(
@@ -306,6 +454,19 @@ export function stripLlmRetryBlock(current: string): string {
 }
 
 /**
+ * Remove a previously generated gateway patch so a gateway-off launch does not keep
+ * routing to the company host or leave `llm-deepseek` disabled inside that block.
+ */
+export function stripGatewayPatchBlock(current: string): string {
+  const start = current.indexOf(GATEWAY_PATCH_BEGIN)
+  const end = start === -1 ? -1 : current.indexOf(GATEWAY_PATCH_END, start)
+  if (start === -1 || end === -1) return current
+  const before = current.slice(0, start).replace(/\s+$/u, '')
+  const after = current.slice(end + GATEWAY_PATCH_END.length).replace(/^\s+/u, '')
+  return `${before}${after ? `\n\n${after}` : '\n'}`
+}
+
+/**
  * Quote a catalog-supplied scalar so a server value cannot alter the document.
  * JSON string syntax is valid inside a YAML double-quoted scalar, and it
  * escapes newlines, quotes, and control characters.
@@ -357,8 +518,24 @@ export function ensureGatewayProfile(profileDir: string, config: GatewayConfig):
 }
 
 /**
+ * Drop the generated gateway block when the gateway is intentionally off (e.g. `DSH_DESKTOP_GATEWAY_ENV=dev`).
+ * Leaves every other patch row alone. Missing or unreadable profiles are ignored.
+ */
+export function clearGatewayProfile(profileDir: string): void {
+  try {
+    const patchPath = join(profileDir, 'cordis.patch.yml')
+    if (!existsSync(patchPath)) return
+    const current = readFileSync(patchPath, 'utf8')
+    const next = stripGatewayPatchBlock(current)
+    if (next !== current) writeFileSync(patchPath, next)
+  } catch (error) {
+    console.error('desktop model gateway profile was not cleared', error)
+  }
+}
+
+/**
  * Redacted login attempt for the console / gateway trace file.
- * Password never appears: only its hashed length and whether Enterprise was sent.
+ * Password and username never appear: only lengths and whether Enterprise was sent.
  */
 export function describeGatewayLoginAttempt(
   url: string,
@@ -369,7 +546,7 @@ export function describeGatewayLoginAttempt(
     at: new Date().toISOString(),
     method: 'POST',
     url,
-    userName: body.UserName ?? '',
+    userNameChars: typeof body.UserName === 'string' ? body.UserName.length : 0,
     enterprise: body.Enterprise ?? null,
     passwordChars: typeof body.Password === 'string' ? body.Password.length : 0,
     ...result,

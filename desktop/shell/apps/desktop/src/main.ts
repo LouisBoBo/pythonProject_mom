@@ -60,7 +60,7 @@ import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashRep
 import { mountWelcomeView, type WelcomeSurface } from './welcome-window.ts'
 import { WELCOME_IPC, needsWelcome, type WelcomeLoginInput, type WelcomeNotice } from './welcome-api.ts'
 import { clearLocalSession, localLoginDirectory, loginInitialized, readValidSession, recordGatewaySession, submitLocalLogin } from './local-login.ts'
-import { resolveGatewayConfig, ensureGatewayProfile, loginWithGateway, logoutWithGateway, fetchGatewayModels, fetchGatewayCaptcha, readGatewayModelsCache, writeGatewayModelsCache, softValidateStoredGatewayToken, GATEWAY_CREDENTIAL_REF } from './model-gateway.ts'
+import { resolveGatewayConfig, applyProjectGatewayDesktopEnv, ensureGatewayProfile, clearGatewayProfile, loginWithGateway, logoutWithGateway, fetchGatewayModels, fetchGatewayCaptcha, readGatewayModelsCache, writeGatewayModelsCache, softValidateStoredGatewayToken, readProjectPersonalModelApiKey, usesPersonalModelKey, GATEWAY_CREDENTIAL_REF, PERSONAL_MODEL_API_KEY_ENV } from './model-gateway.ts'
 import { clearGatewaySessionToken, readGatewaySessionToken, saveGatewaySessionToken } from './gateway-session-token.ts'
 import { trustGatewayCa, writeGatewayCaFile } from './gateway-trust.ts'
 import { connectDesktopWelcome, type DesktopWelcomeBackend } from './welcome-backend.ts'
@@ -261,7 +261,8 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
       sandbox: true,
       webSecurity: true,
       webviewTag: primary,
-      devTools: true,
+      // Packaged builds must not expose DevTools (credential / Host state in renderer memory).
+      devTools: !app.isPackaged,
     },
   })
   window.webContents.setWindowOpenHandler(({ url }) => {
@@ -378,6 +379,8 @@ async function main(): Promise<void> {
     ? developmentPrimaryRuntime()
     : join(process.resourcesPath, 'runtime', 'primary-runtime')
   const activeProject = paths.profile
+  // Project `.env` may set DSH_DESKTOP_GATEWAY_ENV=dev|prod; OS/shell still wins if already set.
+  applyProjectGatewayDesktopEnv()
   const gateway = resolveGatewayConfig()
   if (gateway !== undefined) trustGatewayCa()
   const manager = new DesktopProjectManager(paths, resources)
@@ -400,7 +403,27 @@ async function main(): Promise<void> {
     void loginShell.then((environment) => { probeEnvironment = environment })
     await Promise.resolve()
     hostEnvironment = probeEnvironment ?? process.env
-    if (gateway === undefined) return
+    // No gateway URL at all: strip leftover company route patch.
+    if (gateway === undefined) {
+      clearGatewayProfile(paths.profile)
+      return
+    }
+    //_dev: keep company login (gateway URL), but do not install zr-gateway chat —
+    // models use personal DEEPSEEK_API_KEY from project `.env` / Host env instead.
+    if (usesPersonalModelKey()) {
+      clearGatewayProfile(paths.profile)
+      const personalKey = hostEnvironment[PERSONAL_MODEL_API_KEY_ENV]?.trim()
+        || process.env[PERSONAL_MODEL_API_KEY_ENV]?.trim()
+        || readProjectPersonalModelApiKey()
+      if (personalKey !== undefined && personalKey !== '') {
+        hostEnvironment = { ...hostEnvironment, [PERSONAL_MODEL_API_KEY_ENV]: personalKey }
+      } else {
+        console.warn(`desktop_dev mode: set ${PERSONAL_MODEL_API_KEY_ENV} in project .env for personal model calls`)
+      }
+      const bundle = writeGatewayCaFile(gatewayModelsDirectory, hostEnvironment.NODE_EXTRA_CA_CERTS)
+      if (bundle !== undefined) hostEnvironment = { ...hostEnvironment, NODE_EXTRA_CA_CERTS: bundle }
+      return
+    }
     // The catalog can only refresh after a login, so startup uses the cache
     // from the last one; the built-in list covers a fresh or broken cache.
     const cachedModels = readGatewayModelsCache(gatewayModelsDirectory)
@@ -1267,12 +1290,15 @@ async function main(): Promise<void> {
     { role: 'quit', ...(darwin ? { label: currentDesktopLocale().messages.quitApplication }
       : process.platform === 'win32' ? { label: currentDesktopLocale().messages.exitApplication } : {}) },
   ]
-  const devToolsItems: MenuItemConstructorOptions[] = [
+  // Hidden accelerators only in unpackaged builds; packaged windows have DevTools disabled.
+  const devToolsItems: MenuItemConstructorOptions[] = app.isPackaged ? [] : [
     { role: 'toggleDevTools', visible: false },
     { role: 'toggleDevTools', visible: false, accelerator: 'F12' },
   ]
   const refreshApplicationMenu = (): void => {
-    Menu.setApplicationMenu(Menu.buildFromTemplate(process.platform === 'win32' ? devToolsItems : [{
+    Menu.setApplicationMenu(Menu.buildFromTemplate(process.platform === 'win32' ? (
+      devToolsItems.length === 0 ? [] : devToolsItems
+    ) : [{
       label: darwin ? app.name : currentDesktopLocale().messages.application,
       submenu: [...applicationItems(), ...devToolsItems],
     }, ...platformMenus()]))
@@ -1515,11 +1541,22 @@ async function main(): Promise<void> {
           } catch (error) {
             console.error('desktop model gateway: session token was not persisted', error)
           }
-          const catalog = await fetchGatewayModels(gateway, outcome.token).catch(() => undefined)
-          if (catalog === undefined) {
-            console.warn('desktop model gateway: model catalog unavailable, keeping the built-in model list')
+          //_dev models: company token is only for login/admit; chat needs the personal DeepSeek key.
+          if (usesPersonalModelKey()) {
+            const personalKey = process.env[PERSONAL_MODEL_API_KEY_ENV]?.trim() || readProjectPersonalModelApiKey()
+            if (personalKey === undefined || personalKey === '') {
+              return { ok: false, code: 'server', detail: `开发模式请在项目 .env 配置 ${PERSONAL_MODEL_API_KEY_ENV}` }
+            }
+            if (!(await welcomeBackend.saveRef(PERSONAL_MODEL_API_KEY_ENV, personalKey)).ok) {
+              return { ok: false, code: 'server', detail: '个人模型密钥未保存，请重试' }
+            }
           } else {
-            writeGatewayModelsCache(gatewayModelsDirectory, catalog)
+            const catalog = await fetchGatewayModels(gateway, outcome.token).catch(() => undefined)
+            if (catalog === undefined) {
+              console.warn('desktop model gateway: model catalog unavailable, keeping the built-in model list')
+            } else {
+              writeGatewayModelsCache(gatewayModelsDirectory, catalog)
+            }
           }
           recordGatewaySession(desktopLoginDirectory(), {
             username: outcome.username,
@@ -1530,7 +1567,11 @@ async function main(): Promise<void> {
           finishLogin()
           return { ok: true }
         },
-        skip: async () => { finishLogin() },
+        skip: async () => {
+          // Gateway enterprise login has no "skip"; keep the IPC for API-key onboarding only.
+          if (gateway !== undefined) throw new Error('desktop welcome: skip disabled for gateway login')
+          finishLogin()
+        },
       })
       const window = welcomeWindow
       window.once('closed', () => {
@@ -1597,9 +1638,12 @@ async function main(): Promise<void> {
           token: resolveGatewaySessionToken(),
         }).then((probe) => {
           if (probe !== 'expired') return
+          // Never eject the current workspace; drop local remember-me so the next admit re-auths.
           console.warn('desktop gateway: remembered session token rejected; cleared local copy')
           gatewaySessionToken = undefined
           clearGatewaySessionToken(gatewayModelsDirectory)
+          clearLocalSession(desktopLoginDirectory())
+          publishLocalUser()
         }).catch(() => undefined)
       }
       return

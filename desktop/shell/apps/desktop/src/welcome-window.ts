@@ -43,6 +43,8 @@ export function welcomeWindowOptions(platform: NodeJS.Platform, locale: DesktopL
       contextIsolation: true,
       sandbox: true,
       webSecurity: true,
+      // Match the primary window: no DevTools surface in packaged builds.
+      devTools: !app.isPackaged,
     },
   }
 }
@@ -216,6 +218,8 @@ export async function mountWelcomeView(parent: BrowserWindow, locale: DesktopLoc
       contextIsolation: true,
       sandbox: true,
       webSecurity: true,
+      // Match the primary window: no DevTools surface in packaged builds.
+      devTools: !app.isPackaged,
     },
   })
   const fit = (): void => {

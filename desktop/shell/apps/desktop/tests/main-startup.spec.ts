@@ -387,6 +387,7 @@ vi.mock('../src/welcome-backend.ts', () => ({
     readLocalePreference: async () => null,
     read: async (): Promise<unknown> => (await harness.hosts.at(-1)!.fetch()).json() as Promise<unknown>,
     save: async () => ({ ok: true }),
+    saveRef: async () => ({ ok: true }),
     account: { watch: harness.watchAccount, state: async () => ({ status: 'signed-out', attempt: null }) },
   }),
 }))
@@ -538,9 +539,15 @@ describe('desktop main startup', () => {
     expect((await handler(new Request('dsh-app://unknown/update-dialog.html'))).status).toBe(404)
   })
 
-  it('installs hidden native DevTools shortcuts in the macOS application menu', async () => {
+  it.each([true, false])('configures DevTools for packaged=%s on macOS', async (packaged) => {
     vi.stubGlobal('process', { ...process, platform: 'darwin' })
+    harness.app.isPackaged = packaged
     await readyForUpdate()
+    if (packaged) {
+      expect(applicationMenuItems().some(item => item.role === 'toggleDevTools')).toBe(false)
+      expect(harness.windows[0]!.options).toMatchObject({ webPreferences: { devTools: false } })
+      return
+    }
     expect(applicationMenuItems().slice(-2)).toEqual([
       { role: 'toggleDevTools', visible: false },
       { role: 'toggleDevTools', visible: false, accelerator: 'F12' },
@@ -852,10 +859,9 @@ describe('desktop main startup', () => {
     } else if (platform === 'win32') {
       expect(window.options).toMatchObject({ titleBarStyle: 'hidden', titleBarOverlay: { height: WINDOWS_TITLEBAR_HEIGHT } })
       expect(window.options).not.toHaveProperty('vibrancy')
-      expect(harness.menu.mock.calls[0]![0]).toEqual([
-        { role: 'toggleDevTools', visible: false },
-        { role: 'toggleDevTools', visible: false, accelerator: 'F12' },
-      ])
+      // Packaged builds omit DevTools menu entries; the window itself has DevTools disabled.
+      expect(harness.menu.mock.calls[0]![0]).toEqual([])
+      expect(window.options).toMatchObject({ webPreferences: { devTools: false } })
     } else {
       expect(window.options).not.toHaveProperty('titleBarStyle')
       expect(window.options).not.toHaveProperty('vibrancy')
