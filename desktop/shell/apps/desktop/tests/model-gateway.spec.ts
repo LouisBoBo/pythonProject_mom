@@ -22,6 +22,7 @@ import {
   readGatewayModelsCache,
   resolveGatewayConfig,
   stripLlmRetryBlock,
+  softValidateStoredGatewayToken,
   validateGatewayToken,
   writeGatewayModelsCache,
   type GatewayConfig,
@@ -359,6 +360,17 @@ it('treats ValidateToken 401 as expired and network errors as still usable', asy
   })).toBe(false)
   const offline: GatewayFetch = async () => { throw new Error('offline') }
   expect(await validateGatewayToken(config, 'tok', { fetch: offline })).toBe(true)
+})
+
+it('soft-probes a remembered token without inventing a blocking failure', async () => {
+  expect(await softValidateStoredGatewayToken({ config, token: undefined })).toBe('skipped')
+  expect(await softValidateStoredGatewayToken({ config, token: '  ' })).toBe('skipped')
+  expect(await softValidateStoredGatewayToken({
+    config, token: 'tok', validate: async () => true,
+  })).toBe('valid')
+  expect(await softValidateStoredGatewayToken({
+    config, token: 'tok', validate: async () => false,
+  })).toBe('expired')
 })
 
 it('loads a captcha image from GetCaptcha', async () => {

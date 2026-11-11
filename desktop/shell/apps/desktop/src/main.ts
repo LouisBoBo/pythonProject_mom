@@ -60,7 +60,7 @@ import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashRep
 import { mountWelcomeView, type WelcomeSurface } from './welcome-window.ts'
 import { WELCOME_IPC, needsWelcome, type WelcomeLoginInput, type WelcomeNotice } from './welcome-api.ts'
 import { clearLocalSession, localLoginDirectory, loginInitialized, readValidSession, recordGatewaySession, submitLocalLogin } from './local-login.ts'
-import { resolveGatewayConfig, ensureGatewayProfile, loginWithGateway, logoutWithGateway, fetchGatewayModels, fetchGatewayCaptcha, readGatewayModelsCache, writeGatewayModelsCache, GATEWAY_CREDENTIAL_REF } from './model-gateway.ts'
+import { resolveGatewayConfig, ensureGatewayProfile, loginWithGateway, logoutWithGateway, fetchGatewayModels, fetchGatewayCaptcha, readGatewayModelsCache, writeGatewayModelsCache, softValidateStoredGatewayToken, GATEWAY_CREDENTIAL_REF } from './model-gateway.ts'
 import { clearGatewaySessionToken, readGatewaySessionToken, saveGatewaySessionToken } from './gateway-session-token.ts'
 import { trustGatewayCa, writeGatewayCaFile } from './gateway-trust.ts'
 import { connectDesktopWelcome, type DesktopWelcomeBackend } from './welcome-backend.ts'
@@ -353,10 +353,16 @@ function localSessionActive(): boolean {
  * Nothing else reads them: the shell forwards the cookie it received from the current Host.
  */
 async function discardStaleHostAuthCookies(): Promise<void> {
-  const cookies = await session.defaultSession.cookies.get({})
-  for (const cookie of cookies) {
-    if (!isStaleHostAuthCookie(cookie)) continue
-    await session.defaultSession.cookies.remove(`http://${cookie.domain}${cookie.path}`, cookie.name)
+  const jar = session.defaultSession?.cookies
+  if (jar === undefined || typeof jar.get !== 'function') return
+  try {
+    const cookies = await jar.get({})
+    for (const cookie of cookies) {
+      if (!isStaleHostAuthCookie(cookie)) continue
+      await jar.remove(`http://${cookie.domain}${cookie.path}`, cookie.name)
+    }
+  } catch (error) {
+    console.error('desktop: could not discard stale host cookies', error)
   }
 }
 
@@ -1580,16 +1586,28 @@ async function main(): Promise<void> {
   ipcMain.handle(DESKTOP_IPC.admit, async (event) => {
     assertProductSender(event)
     if (quitting) return
-    // Keep the original gate: local session + credential presence. Do not call
-    // ValidateToken here — a flaky or buggy session check would force every
-    // launch back to the login card. Expired tokens still surface as 401 on chat.
+    // Keep the original gate: local session + credential presence. ValidateToken
+    // runs only as a soft probe after admit succeeds — never blocks the workspace.
     if (localSessionActive() && await gatewayCredentialStored()) {
       enteredWorkspace = true
       publishLocalUser()
+      if (gateway !== undefined) {
+        void softValidateStoredGatewayToken({
+          config: gateway,
+          token: resolveGatewaySessionToken(),
+        }).then((probe) => {
+          if (probe !== 'expired') return
+          console.warn('desktop gateway: remembered session token rejected; cleared local copy')
+          gatewaySessionToken = undefined
+          clearGatewaySessionToken(gatewayModelsDirectory)
+        }).catch(() => undefined)
+      }
       return
     }
     raiseAfterUpdate = false
-    if (gateway !== undefined) await welcomeBackend?.clear()
+    if (gateway !== undefined && welcomeBackend !== undefined && typeof welcomeBackend.clear === 'function') {
+      await welcomeBackend.clear()
+    }
     await showWelcome()
     if (loginFinished) return
     await new Promise<void>((resolve) => { admitRelease = resolve })

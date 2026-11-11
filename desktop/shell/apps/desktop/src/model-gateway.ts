@@ -561,6 +561,25 @@ export async function validateGatewayToken(
   }
 }
 
+export type SoftGatewayTokenProbe = 'valid' | 'expired' | 'skipped'
+
+/**
+ * Best-effort ValidateToken for a remembered session.
+ * Callers must not use `expired` to block workspace admit — only to drop a
+ * local copy that the gateway has already rejected.
+ * @param options - gateway config, optional token, and validate override for tests.
+ */
+export async function softValidateStoredGatewayToken(options: {
+  readonly config: GatewayConfig
+  readonly token: string | undefined
+  readonly validate?: (config: GatewayConfig, token: string) => Promise<boolean>
+}): Promise<SoftGatewayTokenProbe> {
+  const trimmed = options.token?.trim() ?? ''
+  if (trimmed === '') return 'skipped'
+  const validate = options.validate ?? ((config, token) => validateGatewayToken(config, token))
+  return (await validate(options.config, trimmed)) ? 'valid' : 'expired'
+}
+
 /**
  * Fetch a login captcha image after the server asks for one.
  * @param config - resolved gateway.
