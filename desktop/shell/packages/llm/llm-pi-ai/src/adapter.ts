@@ -65,7 +65,14 @@ import type { ResolvedPiAiProviderProfile } from './config.ts'
 import { requestImageTarget, toPiContext } from './context.ts'
 import { conversationUpdates, createModels, getSupportedThinkingLevels } from './models.ts'
 import { toStreamChunks } from './stream.ts'
-import { createUsageRecord, enterpriseIdFromToken, postUsageRecord } from './usage-report.ts'
+import { join } from 'node:path'
+import { createUsageRecord, enterpriseIdFromToken, reportUsageWithQueue } from './usage-report.ts'
+
+function usageQueueDirectory(): string | undefined {
+  const home = process.env.DSH_HOME
+  if (home === undefined || home.trim() === '') return undefined
+  return join(home, 'usage-queue')
+}
 
 /**
  * Initially active declaration added to an Anthropic request whose projected
@@ -396,12 +403,14 @@ export class PiAiAdapter extends LlmAdapter {
     // Reporting is opt-in per route; the resolved credential is also the
     // endpoint's bearer token, so a route without either sends nothing.
     const reportEnterpriseId = apiKey === undefined ? undefined : enterpriseIdFromToken(apiKey)
+    const queueDir = usageQueueDirectory()
     const usageReport = profile.usageReportUrl === undefined || apiKey === undefined || apiKey === ''
       ? undefined
       : {
           url: profile.usageReportUrl,
           token: apiKey,
           ...reportEnterpriseId === undefined ? {} : { enterpriseId: reportEnterpriseId },
+          ...queueDir === undefined ? {} : { queueDir },
         }
     let requestStartedAt: number | undefined
     let requestUsage: TokenUsage | undefined
@@ -493,7 +502,7 @@ export class PiAiAdapter extends LlmAdapter {
             ? `usage report skipped for model "${model.id}": provider reported no usage`
             : `usage report skipped for model "${model.id}": record fields were invalid`)
         } else {
-          void postUsageRecord(record, usageReport)
+          void reportUsageWithQueue(record, usageReport)
         }
       }
     }

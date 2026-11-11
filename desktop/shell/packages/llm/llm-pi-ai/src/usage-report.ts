@@ -5,9 +5,13 @@
  * Reporting is opt-in per route (`usageReportUrl`), so the generic adapter
  * stays provider-neutral and a route without a URL sends nothing. The record
  * carries no prompt text, only counts, status, and a failure message.
+ *
+ * Transient Report failures can land in a local queue under `DSH_HOME` and be
+ * flushed later through `Usage/Batch`. Auth/validation rejects are never queued.
  */
 
 import type { FinishReason, TokenUsage } from '@deepseek-ai/dsh-llm'
+import { enqueueUsageRecord, listUsageQueue, removeUsageRecords } from './usage-queue.ts'
 
 export type UsageReportStatus = 'ok' | 'error' | 'aborted'
 
@@ -50,10 +54,24 @@ export interface UsageRecordTransport {
   readonly fetch?: typeof globalThis.fetch
   readonly timeoutMs?: number
   readonly log?: (message: string) => void
+  /** Directory for failed-report rows; omit to skip disk queueing. */
+  readonly queueDir?: string
 }
+
+export type UsageReportFailure =
+  | { readonly kind: 'http'; readonly status: number }
+  | { readonly kind: 'network'; readonly message: string }
+  | { readonly kind: 'rejected'; readonly content: string }
+  | { readonly kind: 'unreadable' }
+  | { readonly kind: 'envelope' }
+
+export type UsageReportOutcome =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly failure: UsageReportFailure }
 
 /** The company gateway closes idle requests well before this; a report is best-effort. */
 export const USAGE_REPORT_TIMEOUT_MS = 3_000
+export const USAGE_BATCH_MAX = 500
 const MAX_ERROR_MESSAGE = 1_000
 
 function isCount(value: unknown): value is number {
@@ -181,17 +199,102 @@ export function enterpriseIdFromToken(token: string): string | undefined {
   }
 }
 
-function readFunctionResult(payload: unknown): { Success?: unknown; Content?: unknown } | undefined {
+function readFunctionResult(payload: unknown): { Success?: unknown; Content?: unknown; Datas?: unknown } | undefined {
   if (typeof payload !== 'object' || payload === null) return undefined
   const data = (payload as { data?: unknown }).data
   if (typeof data !== 'object' || data === null) return undefined
-  return data as { Success?: unknown; Content?: unknown }
+  return data as { Success?: unknown; Content?: unknown; Datas?: unknown }
+}
+
+function acceptHeader(enterpriseId: string | undefined): string {
+  return enterpriseId === undefined
+    ? 'application/json'
+    : `application/json, enterprisecode$$${enterpriseId}`
+}
+
+/**
+ * Map a Report URL onto the Batch companion path.
+ * @param reportUrl - absolute Usage/Report URL.
+ * @returns Batch URL, or undefined when the path is not a Report endpoint.
+ */
+export function usageBatchUrl(reportUrl: string): string | undefined {
+  try {
+    const url = new URL(reportUrl)
+    const trimmed = url.pathname.replace(/\/+/gu, '/').replace(/\/$/u, '')
+    if (!trimmed.endsWith('/Usage/Report')) return undefined
+    url.pathname = `${trimmed.slice(0, -'/Usage/Report'.length)}/Usage/Batch`
+    return url.href
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Decide whether a failed report should be queued for later Batch flush.
+ * @param failure - classified transport/business failure.
+ * @returns `transient` to enqueue, `rejected` to drop.
+ */
+export function classifyUsageReportFailure(failure: UsageReportFailure): 'transient' | 'rejected' {
+  if (failure.kind === 'http') {
+    if (failure.status === 401 || failure.status === 403 || failure.status === 400) return 'rejected'
+    return 'transient'
+  }
+  if (failure.kind === 'rejected') {
+    if (/登录|令牌|token|无效|不能为空|不能为负|只能是/iu.test(failure.content)) return 'rejected'
+    return 'transient'
+  }
+  return 'transient'
+}
+
+async function postUsageJson(
+  url: string,
+  body: unknown,
+  transport: UsageRecordTransport,
+): Promise<UsageReportOutcome> {
+  const log = transport.log ?? ((message: string) => { console.error(message) })
+  try {
+    const response = await (transport.fetch ?? globalThis.fetch)(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: acceptHeader(transport.enterpriseId),
+        authorization: `Bearer ${transport.token}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(transport.timeoutMs ?? USAGE_REPORT_TIMEOUT_MS),
+    })
+    if (!response.ok) {
+      log(`usage report failed: HTTP ${response.status}`)
+      return { ok: false, failure: { kind: 'http', status: response.status } }
+    }
+    let payload: unknown
+    try {
+      payload = await response.json()
+    } catch {
+      log('usage report failed: unreadable response body')
+      return { ok: false, failure: { kind: 'unreadable' } }
+    }
+    const result = readFunctionResult(payload)
+    if (result === undefined) {
+      log('usage report failed: unrecognized response envelope')
+      return { ok: false, failure: { kind: 'envelope' } }
+    }
+    if (result.Success !== true) {
+      const content = typeof result.Content === 'string' ? result.Content.trim() : ''
+      log(`usage report rejected: ${content === '' ? 'no reason given' : content}`)
+      return { ok: false, failure: { kind: 'rejected', content } }
+    }
+    return { ok: true }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    log(`usage report failed: ${message}`)
+    return { ok: false, failure: { kind: 'network', message } }
+  }
 }
 
 /**
  * Post one record. Never throws and never waits on retries: a failed report
- * must not reach the conversation, and a repeated request would need the
- * queue/Batch path that reporting does not own yet.
+ * must not reach the conversation.
  * @param record - the record to send.
  * @param transport - endpoint, credential, optional fetch override, and log sink.
  * @returns true when the endpoint accepted the record.
@@ -200,47 +303,63 @@ export async function postUsageRecord(
   record: UsageRecord,
   transport: UsageRecordTransport,
 ): Promise<boolean> {
-  const log = transport.log ?? ((message: string) => { console.error(message) })
-  // The gateway reads the usage row's enterprise from this header; the login
-  // token already carries the same id, so no separate setting is needed.
-  const accept = transport.enterpriseId === undefined
-    ? 'application/json'
-    : `application/json, enterprisecode$$${transport.enterpriseId}`
-  try {
-    const response = await (transport.fetch ?? globalThis.fetch)(transport.url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        accept,
-        authorization: `Bearer ${transport.token}`,
-      },
-      body: JSON.stringify(record),
-      signal: AbortSignal.timeout(transport.timeoutMs ?? USAGE_REPORT_TIMEOUT_MS),
-    })
-    if (!response.ok) {
-      log(`usage report failed: HTTP ${response.status}`)
-      return false
-    }
-    let payload: unknown
-    try {
-      payload = await response.json()
-    } catch {
-      log('usage report failed: unreadable response body')
-      return false
-    }
-    const result = readFunctionResult(payload)
-    if (result === undefined) {
-      log('usage report failed: unrecognized response envelope')
-      return false
-    }
-    if (result.Success !== true) {
-      const content = typeof result.Content === 'string' ? result.Content.trim() : ''
-      log(`usage report rejected: ${content === '' ? 'no reason given' : content}`)
-      return false
-    }
+  return (await postUsageJson(transport.url, record, transport)).ok
+}
+
+/**
+ * Post up to {@link USAGE_BATCH_MAX} queued rows. On success every sent id is cleared.
+ * @param records - rows to send (already capped by the caller).
+ * @param transport - Report URL (Batch is derived), credential, optional queueDir.
+ * @returns whether the batch was accepted and which requestIds were cleared.
+ */
+export async function postUsageBatch(
+  records: readonly UsageRecord[],
+  transport: UsageRecordTransport,
+): Promise<{ ok: boolean; cleared: string[] }> {
+  if (records.length === 0) return { ok: true, cleared: [] }
+  const batchUrl = usageBatchUrl(transport.url)
+  if (batchUrl === undefined) return { ok: false, cleared: [] }
+  const chunk = records.slice(0, USAGE_BATCH_MAX)
+  const outcome = await postUsageJson(batchUrl, { records: chunk }, transport)
+  if (!outcome.ok) return { ok: false, cleared: [] }
+  const cleared = chunk.map(row => row.requestId)
+  if (transport.queueDir !== undefined) removeUsageRecords(transport.queueDir, cleared)
+  return { ok: true, cleared }
+}
+
+/**
+ * Report one row, enqueue on transient failure, then best-effort flush the queue.
+ * Never throws.
+ * @param record - the record to send.
+ * @param transport - endpoint plus optional queueDir.
+ * @returns true when the single Report succeeded.
+ */
+export async function reportUsageWithQueue(
+  record: UsageRecord,
+  transport: UsageRecordTransport,
+): Promise<boolean> {
+  const outcome = await postUsageJson(transport.url, record, transport)
+  if (outcome.ok) {
+    if (transport.queueDir !== undefined) await flushUsageQueue(transport)
     return true
-  } catch (error) {
-    log(`usage report failed: ${error instanceof Error ? error.message : String(error)}`)
-    return false
+  }
+  if (transport.queueDir !== undefined && classifyUsageReportFailure(outcome.failure) === 'transient') {
+    enqueueUsageRecord(transport.queueDir, record)
+  }
+  return false
+}
+
+/**
+ * Flush pending rows through Batch. Never throws.
+ * @param transport - must include queueDir to do anything.
+ */
+export async function flushUsageQueue(transport: UsageRecordTransport): Promise<void> {
+  if (transport.queueDir === undefined) return
+  const pending = listUsageQueue(transport.queueDir)
+  if (pending.length === 0) return
+  for (let offset = 0; offset < pending.length; offset += USAGE_BATCH_MAX) {
+    const chunk = pending.slice(offset, offset + USAGE_BATCH_MAX)
+    const result = await postUsageBatch(chunk, transport)
+    if (!result.ok) return
   }
 }

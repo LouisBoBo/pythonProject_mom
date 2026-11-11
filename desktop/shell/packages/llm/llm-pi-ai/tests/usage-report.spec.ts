@@ -1,14 +1,32 @@
-import { describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { FinishReason, TokenUsage } from '@deepseek-ai/dsh-llm'
+import { listUsageQueue } from '../src/usage-queue.ts'
 import {
+  classifyUsageReportFailure,
   createUsageRecord,
   enterpriseIdFromToken,
+  postUsageBatch,
   postUsageRecord,
   reportStatus,
+  reportUsageWithQueue,
   sanitizeErrorMessage,
   totalInputTokens,
+  usageBatchUrl,
 } from '../src/usage-report.ts'
 import type { UsageRecord, UsageRecordTransport } from '../src/usage-report.ts'
+
+const queueDirs: string[] = []
+afterEach(() => {
+  for (const directory of queueDirs.splice(0)) rmSync(directory, { recursive: true, force: true })
+})
+function tempQueue(): string {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-usage-report-queue-'))
+  queueDirs.push(directory)
+  return directory
+}
 
 const USAGE: TokenUsage = { inputTokens: 100, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 5 }
 const STOP: FinishReason = { kind: 'stop' }
@@ -254,5 +272,95 @@ describe('postUsageRecord', () => {
     await expect(postUsageRecord(record, transport(fetch as unknown as typeof globalThis.fetch, log)))
       .resolves.toBe(false)
     expect(log).toHaveBeenCalledWith('usage report failed: unrecognized response envelope')
+  })
+})
+
+describe('usage batch and queue', () => {
+  it('derives the Batch URL from the Report URL', () => {
+    expect(usageBatchUrl('https://gw.example/api/ai/Usage/Report'))
+      .toBe('https://gw.example/api/ai/Usage/Batch')
+    expect(usageBatchUrl('https://gw.example/api/ai/Usage/Report/'))
+      .toBe('https://gw.example/api/ai/Usage/Batch')
+    expect(usageBatchUrl('https://gw.example/api/ai/other')).toBeUndefined()
+  })
+
+  it('classifies transport failures as transient and auth rejects as permanent', () => {
+    expect(classifyUsageReportFailure({ kind: 'http', status: 500 })).toBe('transient')
+    expect(classifyUsageReportFailure({ kind: 'http', status: 429 })).toBe('transient')
+    expect(classifyUsageReportFailure({ kind: 'network', message: 'ECONNREFUSED' })).toBe('transient')
+    expect(classifyUsageReportFailure({ kind: 'rejected', content: '当前登录用户无效' })).toBe('rejected')
+    expect(classifyUsageReportFailure({ kind: 'http', status: 401 })).toBe('rejected')
+    expect(classifyUsageReportFailure({ kind: 'http', status: 403 })).toBe('rejected')
+  })
+
+  it('posts a Batch body and removes every sent id when the batch succeeds', async () => {
+    const directory = tempQueue()
+    const pending = [recordOf({ requestId: 'id-1' }), recordOf({ requestId: 'id-2' }), recordOf({ requestId: 'id-3' })]
+    const { enqueueUsageRecord } = await import('../src/usage-queue.ts')
+    for (const row of pending) enqueueUsageRecord(directory, row)
+
+    const fetch = vi.fn(async () => new Response(JSON.stringify({
+      data: { Success: true, Content: '', Datas: { accepted: 2, duplicates: 1 } },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const result = await postUsageBatch(pending, {
+      url: 'http://gateway.test/api/ai/Usage/Report',
+      token: 'token-123',
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      queueDir: directory,
+    })
+    expect(result).toEqual({ ok: true, cleared: ['id-1', 'id-2', 'id-3'] })
+    const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('http://gateway.test/api/ai/Usage/Batch')
+    expect(JSON.parse(String(init.body))).toEqual({ records: pending })
+    expect(listUsageQueue(directory)).toEqual([])
+  })
+
+  it('enqueues on transient failure and flushes on the next success', async () => {
+    const directory = tempQueue()
+    const first = recordOf({ requestId: '550e8400-e29b-41d4-a716-446655440001' })
+    const log = vi.fn()
+    const failing = vi.fn(async () => new Response('nope', { status: 500 }))
+    await expect(reportUsageWithQueue(first, {
+      url: 'http://gateway.test/api/ai/Usage/Report',
+      token: 'token-123',
+      fetch: failing as unknown as typeof globalThis.fetch,
+      log,
+      queueDir: directory,
+    })).resolves.toBe(false)
+    expect(listUsageQueue(directory)).toEqual([first])
+
+    const ok = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/Usage/Report')) return ack()
+      return new Response(JSON.stringify({
+        data: { Success: true, Content: '', Datas: { accepted: 1, duplicates: 0 } },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const next = recordOf({ requestId: '550e8400-e29b-41d4-a716-446655440099' })
+    await expect(reportUsageWithQueue(next, {
+      url: 'http://gateway.test/api/ai/Usage/Report',
+      token: 'token-123',
+      fetch: ok as unknown as typeof globalThis.fetch,
+      log,
+      queueDir: directory,
+    })).resolves.toBe(true)
+    expect(listUsageQueue(directory)).toEqual([])
+  })
+
+  it('does not enqueue permanent auth rejection', async () => {
+    const directory = tempQueue()
+    const rejected = recordOf({ requestId: '550e8400-e29b-41d4-a716-446655440002' })
+    const log = vi.fn()
+    const fetch = vi.fn(async () => new Response(JSON.stringify({
+      data: { Success: false, Content: '当前登录用户无效' },
+    })))
+    await expect(reportUsageWithQueue(rejected, {
+      url: 'http://gateway.test/api/ai/Usage/Report',
+      token: 'token-123',
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      log,
+      queueDir: directory,
+    })).resolves.toBe(false)
+    expect(listUsageQueue(directory)).toEqual([])
   })
 })
