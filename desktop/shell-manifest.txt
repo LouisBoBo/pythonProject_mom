@@ -107,3 +107,8 @@ packages/llm/llm-pi-ai/tests/stream-guard.spec.ts
 packages/llm/llm-pi-ai/tests/usage-report.spec.ts
 packages/llm/llm-pi-ai/tests/usage-report-adapter.spec.ts
 packages/llm/llm-pi-ai/tests/usage-queue.spec.ts
+apps/desktop/scripts/dev.ts
+apps/desktop/scripts/prepare-windows-installer.ps1
+apps/desktop/scripts/windows-directory-installer.mjs
+apps/desktop/tests/windows-directory-installer.spec.ts
+apps/web/src/main.ts

@@ -1,26 +1,27 @@
 ---
-description: 改完桌面壳必须同步回 desktop/shell
+description: 产品壳只改 DSH_MOM，禁止把 C:\dsh-src 当正本
 alwaysApply: true
 ---
 
-# 桌面壳改动同步
+# 产品壳只改 DSH_MOM
 
-`C:\dsh-src`（macOS 打包目录是 `~/dsh-src`）里的桌面壳改动，以本仓库 `desktop/shell` 为准。两边必须一致。
+产品壳的正本只有 `D:\AICodes\DSH_MOM\pythonProject_dsh_mom` 的 `desktop/shell`。清单是 `desktop/shell-manifest.txt`。
 
-凡是改了 `C:\dsh-src` 里属于本产品的壳文件，在结束这次改动之前执行：
-
-```powershell
-powershell -File desktop\shell-sync.ps1 -Mode capture
-```
+`C:\dsh-src`（macOS 是 `~/dsh-src`）是打包用的编译目录。准备脚本把上游 `dsh-v0.2.1-rc.2` 放在这里，再把 `desktop/shell` 盖上去。这里的 git 改动是覆盖层相对上游的差异，不是另一份产品仓。
 
 ## 必须
 
-- 改动的路径已经写在 `desktop/shell-manifest.txt` 里。新文件先追加到清单，再执行 `capture`。
-- `capture` 成功之后，`desktop/shell` 里对应文件和 `C:\dsh-src` 内容相同。
-- 向用户说明壳改动时，同时说明已经收回 `desktop/shell`。
+- 改产品壳：只改 `desktop/shell`。新文件先写入 `desktop/shell-manifest.txt`。
+- 要在编译目录里验证：先改 `DSH_MOM`，再执行 `powershell -File desktop\shell-sync.ps1 -Mode apply`，然后编译。
+- 结束时说明改动落在 `desktop/shell` 的哪些路径。还没提交就说明没提交。
 
 ## 禁止
 
-- 只改 `C:\dsh-src`，不执行 `capture` 就结束。
-- 清单之外的新文件留在 `C:\dsh-src`，却宣称已经同步。
-- 把 `desktop-test-home` 或本机测试残留写进清单。
+- 把 `C:\dsh-src` 当作产品壳来改、来提交、来当正本。
+- 只改 `C:\dsh-src` 就结束。下次准备或重新克隆会丢掉这些改动。
+- 先在 `C:\dsh-src` 改完，再指望事后 `capture`。`capture` 只用于已经误改编译目录时的收回；收回后的正本仍是 `desktop/shell`。
+
+```text
+❌ 改 C:\dsh-src\apps\desktop\src\main.ts
+✅ 改 D:\AICodes\DSH_MOM\pythonProject_dsh_mom\desktop\shell\apps\desktop\src\main.ts
+```

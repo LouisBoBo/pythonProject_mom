@@ -25,6 +25,7 @@ Var dshRecoveryStopped
       ${AndIf} "$dshFinalDirectory" != ""
         Push $3
         System::Call '$PLUGINSDIR\window-frame.dll::InstallerCloseApp(w "$dshFinalDirectory\${APP_EXECUTABLE_FILENAME}") i.r3 ?c'
+        System::Call '$PLUGINSDIR\window-frame.dll::InstallerReleaseDirectory(w "${SOURCE}") i.r3 ?c'
         Pop $3
       ${EndIf}
     !endif

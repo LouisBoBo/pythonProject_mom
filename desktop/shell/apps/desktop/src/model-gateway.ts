@@ -17,7 +17,7 @@ import { SESSION_TTL_MS } from './local-login.ts'
  * Used when `ZR_MODEL_GATEWAY_URL` is absent. `dev` still uses this for UserLogin.
  * The company server currently serves plain HTTP only (no TLS listener).
  */
-export const DEFAULT_GATEWAY_BASE_URL = 'http://113.90.149.166:6680'
+export const DEFAULT_GATEWAY_BASE_URL = 'http://113.90.149.166:19750'
 
 /**
  * Desktop mode switch (`DSH_DESKTOP_GATEWAY_ENV` in project `.env` or the process env).

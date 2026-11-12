@@ -4,12 +4,12 @@
 #define UNICODE
 #include <windows.h>
 #include <tlhelp32.h>
+#include <restartmanager.h>
 #include <objidl.h>
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <gdiplus.h>
 #include <new>
-#include <algorithm>
 #include "progress.h"
 #include "extract.h"
 #include "extract-report.h"
@@ -101,6 +101,170 @@ static bool InstallerImageInDirectory(LPCWSTR executable, LPCWSTR image) {
     const size_t directory = wcslen(expected);
     if (directory == 0 || _wcsnicmp(actual, expected, directory) != 0) return false;
     return actual[directory] == L'\\';
+}
+
+// Ends the Restart Manager session on every return, including allocation failure.
+struct InstallerRmSession {
+    DWORD value = 0;
+    bool open = false;
+    ~InstallerRmSession() { if (open) RmEndSession(value); }
+    bool start() {
+        WCHAR key[CCH_RM_SESSION_KEY + 1] = {};
+        if (RmStartSession(&value, 0, key) != ERROR_SUCCESS) return false;
+        open = true;
+        return true;
+    }
+};
+
+// Drive roots, the Windows tree, and the shell folders that contain unrelated programs.
+// A child of Program Files is a normal install directory and stays eligible.
+static bool InstallerProtectedPath(const std::wstring& path) {
+    if (path.size() <= 3) return true;
+    if (path.size() == 8 && _wcsicmp(path.c_str() + 3, L"Users") == 0) return true;
+    WCHAR windows[MAX_PATH];
+    const UINT length = GetWindowsDirectoryW(windows, ARRAYSIZE(windows));
+    std::wstring windowsDir;
+    if (length == 0 || length >= ARRAYSIZE(windows) || !uninstall_data::Normalize(windows, windowsDir)) return true;
+    if (uninstall_data::Contains(windowsDir, path) || uninstall_data::Contains(path, windowsDir)) return true;
+    const LPCWSTR variables[] = {L"ProgramFiles", L"ProgramFiles(x86)", L"ProgramW6432", L"ProgramData", L"PUBLIC"};
+    for (LPCWSTR variable : variables) {
+        WCHAR value[MAX_PATH];
+        const DWORD count = GetEnvironmentVariableW(variable, value, ARRAYSIZE(value));
+        std::wstring folder;
+        if (count == 0 || count >= ARRAYSIZE(value) || !uninstall_data::Normalize(value, folder)) continue;
+        if (_wcsicmp(path.c_str(), folder.c_str()) == 0 || uninstall_data::Contains(path, folder)) return true;
+    }
+    return false;
+}
+
+static void InstallerRememberFile(const std::wstring& path, std::vector<std::wstring>& files, size_t limit) {
+    if (files.size() >= limit) return;
+    for (const std::wstring& existing : files) {
+        if (_wcsicmp(existing.c_str(), path.c_str()) == 0) return;
+    }
+    files.push_back(path);
+}
+
+// Directory links are not followed: a junction inside the install tree must not
+// register files outside it and then become a reason to stop unrelated programs.
+static void InstallerCollectFiles(const std::wstring& root, const std::wstring& directory,
+    std::vector<std::wstring>& files, size_t limit) {
+    if (files.size() >= limit) return;
+    std::vector<std::wstring> children;
+    {
+        struct Find {
+            HANDLE value;
+            explicit Find(HANDLE found) : value(found) {}
+            ~Find() { if (value != INVALID_HANDLE_VALUE) FindClose(value); }
+        };
+        WIN32_FIND_DATAW data = {};
+        const Find found(FindFirstFileW((L"\\\\?\\" + directory + L"\\*").c_str(), &data));
+        if (found.value == INVALID_HANDLE_VALUE) return;
+        size_t seen = 0;
+        do {
+            if (++seen > 4096) break;
+            if (data.cFileName[0] == L'.' && (data.cFileName[1] == L'\0'
+                || (data.cFileName[1] == L'.' && data.cFileName[2] == L'\0'))) continue;
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
+            const std::wstring path = directory + L"\\" + data.cFileName;
+            if (!uninstall_data::Contains(root, path)) continue;
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) children.push_back(path);
+            else InstallerRememberFile(path, files, limit);
+        } while (FindNextFileW(found.value, &data));
+    }
+    for (const std::wstring& child : children) InstallerCollectFiles(root, child, files, limit);
+}
+
+// Only stop a same-session program whose image is outside Windows and the other
+// protected roots. Services, Explorer, and critical processes keep their files open.
+static int InstallerStopLockingProcesses(const std::vector<RM_PROCESS_INFO>& processes) {
+    DWORD selfSession = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &selfSession) || selfSession == 0) return 0;
+    const DWORD self = GetCurrentProcessId();
+    int stopped = 0;
+    for (const RM_PROCESS_INFO& info : processes) {
+        switch (info.ApplicationType) {
+        case RmService:
+        case RmExplorer:
+        case RmCritical:
+            continue;
+        case RmUnknownApp:
+        case RmMainWindow:
+        case RmOtherWindow:
+        case RmConsole:
+            break;
+        default:
+            continue;
+        }
+        if (info.TSSessionId != selfSession) continue;
+        const DWORD pid = static_cast<DWORD>(info.Process.dwProcessId);
+        if (pid == 0 || pid == self) continue;
+        const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+        if (process == nullptr) continue;
+        WCHAR image[32768];
+        DWORD count = ARRAYSIZE(image);
+        bool allowed = false;
+        if (QueryFullProcessImageNameW(process, 0, image, &count)) {
+            BOOL critical = FALSE;
+            std::wstring path;
+            if (!(IsProcessCritical(process, &critical) && critical)
+                && uninstall_data::Normalize(image, path) && !InstallerProtectedPath(path)) allowed = true;
+        }
+        if (allowed && TerminateProcess(process, 1)) {
+            WaitForSingleObject(process, 2000);
+            stopped += 1;
+        }
+        CloseHandle(process);
+    }
+    return stopped;
+}
+
+static int InstallerReleaseDirectoryBody(LPCWSTR directory);
+
+// Close ordinary programs holding files in this directory so the directory itself can be renamed.
+// Returns how many programs were stopped, or -1 when the lock list cannot be read.
+extern "C" __declspec(dllexport) int __cdecl InstallerReleaseDirectory(LPCWSTR directory) {
+    if (directory == nullptr || directory[0] == L'\0') return 0;
+    try {
+        return InstallerReleaseDirectoryBody(directory);
+    } catch (const std::bad_alloc&) {
+        return -1;
+    }
+}
+
+static int InstallerReleaseDirectoryBody(LPCWSTR directory) {
+    std::wstring root;
+    if (!uninstall_data::Normalize(directory, root) || InstallerProtectedPath(root)) return 0;
+    const DWORD attributes = GetFileAttributesW((L"\\\\?\\" + root).c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+        || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return 0;
+    std::vector<std::wstring> files;
+    const std::wstring asar = root + L"\\resources\\app.asar";
+    const DWORD asarAttributes = GetFileAttributesW((L"\\\\?\\" + asar).c_str());
+    if (asarAttributes != INVALID_FILE_ATTRIBUTES
+        && (asarAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) == 0)
+        InstallerRememberFile(asar, files, 256);
+    InstallerCollectFiles(root, root, files, 256);
+    if (files.empty()) return 0;
+    InstallerRmSession session;
+    if (!session.start()) return -1;
+    std::vector<LPCWSTR> names;
+    names.reserve(files.size());
+    for (const std::wstring& file : files) names.push_back(file.c_str());
+    DWORD result = RmRegisterResources(session.value, static_cast<UINT>(names.size()), names.data(), 0, nullptr, 0, nullptr);
+    if (result != ERROR_SUCCESS) return -1;
+    UINT needed = 0;
+    UINT count = 0;
+    DWORD reasons = 0;
+    result = RmGetList(session.value, &needed, &count, nullptr, &reasons);
+    if (result == ERROR_SUCCESS) return 0;
+    if (result != ERROR_MORE_DATA || needed == 0 || needed > 64) return -1;
+    std::vector<RM_PROCESS_INFO> processes(needed);
+    count = needed;
+    result = RmGetList(session.value, &needed, &count, processes.data(), &reasons);
+    if (result != ERROR_SUCCESS || count > processes.size()) return -1;
+    processes.resize(count);
+    return InstallerStopLockingProcesses(processes);
 }
 
 // Match the affected executable, not another user's or directory's same-named application.
