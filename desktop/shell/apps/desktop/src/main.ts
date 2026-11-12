@@ -1632,6 +1632,16 @@ async function main(): Promise<void> {
     if (localSessionActive() && await gatewayCredentialStored()) {
       enteredWorkspace = true
       publishLocalUser()
+      // Remembered company admit never re-runs submitLogin; dev still needs the
+      // personal DeepSeek key in the credential store for chat.
+      if (usesPersonalModelKey() && welcomeBackend !== undefined) {
+        const personalKey = process.env[PERSONAL_MODEL_API_KEY_ENV]?.trim() || readProjectPersonalModelApiKey()
+        if (personalKey !== undefined && personalKey !== '') {
+          await welcomeBackend.saveRef(PERSONAL_MODEL_API_KEY_ENV, personalKey).catch(() => ({ ok: false }))
+        } else {
+          console.warn(`desktop_dev mode: set ${PERSONAL_MODEL_API_KEY_ENV} in project .env for personal model calls`)
+        }
+      }
       if (gateway !== undefined) {
         void softValidateStoredGatewayToken({
           config: gateway,

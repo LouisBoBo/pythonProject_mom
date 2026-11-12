@@ -101,9 +101,9 @@ it('accepts HTTPS origins, loopback HTTP, and the deployment host over HTTP', ()
   expect(parseGatewayBaseUrl('http://127.0.0.1:8787')).toBe('http://127.0.0.1:8787')
   expect(parseGatewayBaseUrl('http://localhost:8787')).toBe('http://localhost:8787')
   expect(parseGatewayBaseUrl('http://[::1]:8787')).toBe('http://[::1]:8787')
-  expect(parseGatewayBaseUrl('http://113.90.149.166:11231')).toBe('http://113.90.149.166:11231')
+  expect(parseGatewayBaseUrl('http://113.90.149.166:6680')).toBe('http://113.90.149.166:6680')
   expect(parseGatewayBaseUrl('http://gateway.example')).toBeUndefined()
-  expect(parseGatewayBaseUrl('http://192.168.1.10:11231')).toBeUndefined()
+  expect(parseGatewayBaseUrl('http://192.168.1.10:6680')).toBeUndefined()
   expect(parseGatewayBaseUrl('https://gateway.example/v1')).toBeUndefined()
   expect(parseGatewayBaseUrl('https://user:secret@gateway.example')).toBeUndefined()
   expect(parseGatewayBaseUrl('https://gateway.example/?tenant=1')).toBeUndefined()
@@ -125,7 +125,7 @@ it('stays off without a URL and reads the environment first', () => {
 })
 
 it('falls back to the company server when no URL is configured', () => {
-  expect(resolveGatewayConfig({})).toMatchObject({ baseUrl: 'http://113.90.149.166:11231' })
+  expect(resolveGatewayConfig({})).toMatchObject({ baseUrl: 'http://113.90.149.166:6680' })
 })
 
 it('treats only DSH_DESKTOP_GATEWAY_ENV=dev as personal-model mode', () => {
@@ -139,7 +139,7 @@ it('keeps the company gateway URL in dev so login still uses company UserLogin',
   expect(usesPersonalModelKey({ DSH_DESKTOP_GATEWAY_ENV: 'dev' })).toBe(true)
   expect(usesPersonalModelKey({ DSH_DESKTOP_GATEWAY_ENV: 'prod' })).toBe(false)
   expect(resolveGatewayConfig({ DSH_DESKTOP_GATEWAY_ENV: 'dev' })).toMatchObject({
-    baseUrl: 'http://113.90.149.166:11231',
+    baseUrl: 'http://113.90.149.166:6680',
   })
 })
 
