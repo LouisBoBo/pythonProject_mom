@@ -27,7 +27,7 @@
 
 | 用途 | 默认 |
 | --- | --- |
-| 模型 / 登录 / 用量网关 | `ZR_MODEL_GATEWAY_URL` → 现网如 `http://113.90.149.166:19750` |
+| 模型 / 登录 / 用量网关 | `ZR_MODEL_GATEWAY_URL` → 现网如 `http://113.90.149.166:19772` |
 | 安装包 feed | `ZR_MOM_UPDATE_FEED_BASE` → `https://175.178.238.31:8443/dsh-mom-desktop/` |
 | 插件目录根 | `ZR_DSH_MARKET_BASE` → `https://175.178.238.31:8443/dsh-plugins/` |
 
