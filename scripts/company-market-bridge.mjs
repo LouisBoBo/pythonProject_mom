@@ -10,7 +10,9 @@
  * This bridge only adapts market metadata. Plugin behavior/UI fixes belong in
  * each plugin's own repository — do not patch plugin code from this repo.
  */
-import { createServer } from 'node:http'
+import { lookup as dnsLookup } from 'node:dns/promises'
+import { createServer, request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
 import { Readable } from 'node:stream'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -153,15 +155,123 @@ export function publicRedirectUrl(location, current) {
   return url.href
 }
 
+function defaultDnsLookup(hostname) {
+  return dnsLookup(hostname, { all: true, verbatim: true })
+}
+
+/**
+ * Reject a redirect whose name resolves to a private, loopback, or metadata address.
+ * The hostname string check cannot see that. Lookup failure also rejects: a name
+ * we cannot resolve is not followed. The first request to the configured registry
+ * is not passed through here, so an operator-chosen internal registry still works.
+ * @param {string} hostname URL hostname, brackets allowed
+ * @param {(host: string) => Promise<Array<{ address?: string }> | { address?: string }>} lookup
+ * @returns {Promise<string[]>} public addresses the follow-up connection must use
+ */
+export async function assertResolvedHostPublic(hostname, lookup = defaultDnsLookup) {
+  const host = hostname.replace(/^\[|\]$/g, '')
+  let records
+  try {
+    records = await lookup(host)
+  } catch {
+    throw new Error('rejected redirect')
+  }
+  const list = Array.isArray(records) ? records : [records]
+  if (list.length === 0) throw new Error('rejected redirect')
+  const addresses = []
+  for (const record of list) {
+    const address = typeof record === 'string' ? record : record?.address
+    if (typeof address !== 'string' || address === '' || blockedRedirectHost(address)) {
+      throw new Error('rejected redirect')
+    }
+    addresses.push(address)
+  }
+  return addresses
+}
+
+/**
+ * DNS lookup that returns only addresses already accepted by {@link assertResolvedHostPublic}.
+ * The follow-up request uses this so a name cannot be rebound to a private address
+ * between the check and the connection.
+ * @param {readonly string[]} addresses
+ */
+export function pinnedDnsLookup(addresses) {
+  const records = addresses.map((address) => ({
+    address,
+    family: address.includes(':') ? 6 : 4,
+  }))
+  if (records.length === 0) throw new Error('rejected redirect')
+  return function lookup(_hostname, options, callback) {
+    let settings = options
+    let done = callback
+    if (typeof settings === 'function') {
+      done = settings
+      settings = {}
+    }
+    if (typeof done !== 'function') throw new Error('rejected redirect')
+    const family = settings && (settings.family === 4 || settings.family === 6) ? settings.family : 0
+    const chosen = family === 0 ? records : records.filter((record) => record.family === family)
+    if (chosen.length === 0) {
+      done(Object.assign(new Error('rejected redirect'), { code: 'ENOTFOUND' }))
+      return
+    }
+    if (settings && settings.all) {
+      done(null, chosen)
+      return
+    }
+    done(null, chosen[0].address, chosen[0].family)
+  }
+}
+
+function fetchPinned(target, accept, addresses) {
+  const url = new URL(target)
+  const request = url.protocol === 'https:' ? httpsRequest : httpRequest
+  const lookup = pinnedDnsLookup(addresses)
+  return new Promise((resolve, reject) => {
+    const req = request(url, {
+      method: 'GET',
+      headers: { accept, 'accept-encoding': 'identity' },
+      lookup,
+    }, (incoming) => {
+      const headers = new Headers()
+      for (const [key, value] of Object.entries(incoming.headers)) {
+        if (value === undefined) continue
+        const items = Array.isArray(value) ? value : [value]
+        for (const item of items) headers.append(key, item)
+      }
+      resolve(new Response(Readable.toWeb(incoming), {
+        status: incoming.statusCode ?? 502,
+        headers,
+      }))
+    })
+    req.on('error', reject)
+  })
+}
+
+/** String checks first, then DNS. Literal private addresses never hit the resolver. */
+export async function publicRedirectTarget(location, current, lookup = defaultDnsLookup) {
+  const href = publicRedirectUrl(location, current)
+  await assertResolvedHostPublic(new URL(href).hostname, lookup)
+  return href
+}
+
 async function fetchPublic(target, accept) {
   let current = target
+  /** @type {string[] | undefined} */
+  let pin
   for (let hop = 0; hop < 5; hop += 1) {
-    const upstream = await fetch(current, { headers: { accept }, redirect: 'manual' })
+    // The configured registry is fetched as given, including an operator-chosen
+    // internal host. A redirect is connected only to the addresses just checked.
+    const upstream = pin === undefined
+      ? await fetch(current, { headers: { accept }, redirect: 'manual' })
+      : await fetchPinned(current, accept, pin)
     if (upstream.status < 300 || upstream.status >= 400) return upstream
     const location = upstream.headers.get('location')
     await upstream.body?.cancel()
     if (!location) return upstream
-    current = publicRedirectUrl(location, current)
+    const next = new URL(publicRedirectUrl(location, current))
+    pin = await assertResolvedHostPublic(next.hostname)
+    current = next.href
   }
   throw new Error('rejected redirect')
 }

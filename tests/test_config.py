@@ -103,12 +103,38 @@ def test_non_finite_timeout_and_unsafe_base_url_are_rejected(tmp_path: Path) -> 
             project_root=tmp_path,
             use_dotenv=False,
         )
-    with pytest.raises(SettingsError, match="账号或密码"):
+    with pytest.raises(SettingsError, match="账号或密码") as credential_error:
         load_settings(
             environ={"DEEPSEEK_BASE_URL": "https://user:secret@example.com/v1"},
             project_root=tmp_path,
             use_dotenv=False,
         )
+    assert "secret" not in str(credential_error.value)
+
+
+def test_rejected_base_url_does_not_echo_credentials(tmp_path: Path) -> None:
+    secret = "super-secret-token"
+    with pytest.raises(SettingsError, match="DEEPSEEK_BASE_URL") as caught:
+        load_settings(
+            environ={"DEEPSEEK_BASE_URL": f"ftp://deploy:{secret}@example.com/v1"},
+            project_root=tmp_path,
+            use_dotenv=False,
+        )
+    message = str(caught.value)
+    assert secret not in message
+    assert "deploy" not in message
+    assert "example.com" in message
+
+    with pytest.raises(SettingsError, match="DEEPSEEK_BASE_URL") as query_error:
+        load_settings(
+            environ={"DEEPSEEK_BASE_URL": f"ftp://example.com/v1?token={secret}#frag"},
+            project_root=tmp_path,
+            use_dotenv=False,
+        )
+    query_message = str(query_error.value)
+    assert secret not in query_message
+    assert "example.com" in query_message
+    assert "frag" not in query_message
 
 
 def test_dotenv_accepts_export_prefix(tmp_path: Path) -> None:

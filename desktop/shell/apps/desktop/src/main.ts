@@ -50,6 +50,7 @@ import {
   rewriteStalePluginRevision,
   serveCachedShellScript,
   shellScriptKeys,
+  shouldIgnorePluginApplyWebBoot,
   writeDesktopLocalePreference,
   writeDesktopShellSnapshot,
   type DesktopShellSnapshot,
@@ -502,10 +503,23 @@ async function main(): Promise<void> {
   let shellSnapshotLoaded = false
   let servedCachedShell = false
   let pluginApply = false
+  /** Main frame showing when a plugin soft-restart began. Only that frame's boot failure is ignored. */
+  let pluginApplyDyingFrame: object | undefined
+  /**
+   * Snapshot captured while the dying page still needs the previous revision files.
+   * `hold` waits for navigate, `commit` writes a snapshot that arrives after navigate,
+   * `discard` drops one when the restart never replaced the page.
+   */
+  let shellSnapshotHold: { state: 'hold' | 'commit' | 'discard'; pending?: DesktopShellSnapshot } | undefined
   /** Plugin-manager calls on the wire; the profile watcher must not restart the Host under them. */
   let pluginRequests = 0
   let pluginWatch: { close(): void } | undefined
   let applyInstalledPlugins: () => Promise<boolean> = async () => false
+  const commitShellSnapshot = (snapshot: DesktopShellSnapshot): void => {
+    writeDesktopShellSnapshot(zrDesktopHome(), snapshot)
+    shellSnapshot = snapshot
+    shellSnapshotLoaded = true
+  }
   const currentShellSnapshot = (): DesktopShellSnapshot | undefined => {
     if (!shellSnapshotLoaded) {
       shellSnapshotLoaded = true
@@ -632,12 +646,26 @@ async function main(): Promise<void> {
         pluginRevisions = pluginScriptRevisions(injections)
         refreshRunningShell()
         if (pluginWatch === undefined) pluginWatch = watchProfilePlugins(paths.profile, () => applyInstalledPlugins())
+        // A retry drops the capture still waiting for navigate. Once a newer start
+        // replaces `shellSnapshotHold`, the previous capture must not write over it.
+        if (shellSnapshotHold?.state === 'hold') {
+          shellSnapshotHold.state = 'discard'
+          shellSnapshotHold.pending = undefined
+        }
+        const snapshotHold: { state: 'hold' | 'commit' | 'discard'; pending?: DesktopShellSnapshot } = {
+          state: pluginApply ? 'hold' : 'commit',
+        }
+        shellSnapshotHold = snapshotHold
         void captureDesktopShellSnapshot(app.getVersion(), ready.url, hostCookie, injections, (input, init) => net.fetch(input, init))
           .then((snapshot) => {
-            if (snapshot === undefined) return
-            writeDesktopShellSnapshot(zrDesktopHome(), snapshot)
-            shellSnapshot = snapshot
-            shellSnapshotLoaded = true
+            if (snapshot === undefined || shellSnapshotHold !== snapshotHold || snapshotHold.state === 'discard') return
+            // During plugin soft-restart the previous page still needs the old rev files.
+            // Hold the new snapshot until navigate, and drop it if this start was abandoned.
+            if (snapshotHold.state === 'hold') {
+              snapshotHold.pending = snapshot
+              return
+            }
+            commitShellSnapshot(snapshot)
           })
           .catch((error: unknown) => { console.error(error) })
         welcomeBackend = await connectDesktopWelcome(ready.url, (input, init) => net.fetch(input, init), async () => (await session.defaultSession.cookies.get({ url: ready.url })).map(cookie => `${cookie.name}=${cookie.value}`).join('; '), gateway === undefined ? {} : { credentialRef: GATEWAY_CREDENTIAL_REF })
@@ -710,7 +738,24 @@ async function main(): Promise<void> {
     // Two watcher ticks can reach the wait together; only one of them may own the restart.
     if (quitting || shuttingDown || pluginApply) return false
     pluginApply = true
+    // Only the frame on screen now is the dying page. The replacement frame's boot
+    // failure must still open the fatal dialog.
+    pluginApplyDyingFrame = mainWindow !== undefined && !mainWindow.isDestroyed()
+      ? mainWindow.webContents.mainFrame
+      : undefined
     let hostReady: Promise<void> | undefined
+    let replacedPage = false
+    const finishSoftRestartNavigation = async (): Promise<void> => {
+      bootedScriptKeys = undefined
+      navigation = undefined
+      await navigateMain(applicationUrl)
+      replacedPage = true
+      const hold = shellSnapshotHold
+      if (hold?.state === 'hold') {
+        hold.state = 'commit'
+        if (hold.pending !== undefined) commitShellSnapshot(hold.pending)
+      }
+    }
     try {
       hostUrl = undefined
       hostCookie = undefined
@@ -720,9 +765,7 @@ async function main(): Promise<void> {
       startup = hostReady
       await hostReady
       if (quitting || backend.host === undefined) return true
-      bootedScriptKeys = undefined
-      navigation = undefined
-      await navigateMain(applicationUrl)
+      await finishSoftRestartNavigation()
       return true
     } catch (error) {
       console.error('desktop plugin apply failed', error)
@@ -732,8 +775,7 @@ async function main(): Promise<void> {
           startup = hostReady
           await hostReady
           if (backend.host !== undefined) {
-            navigation = undefined
-            await navigateMain(applicationUrl)
+            await finishSoftRestartNavigation()
             return true
           }
         } catch (retryError) {
@@ -743,6 +785,11 @@ async function main(): Promise<void> {
       return false
     } finally {
       pluginApply = false
+      pluginApplyDyingFrame = undefined
+      if (!replacedPage && shellSnapshotHold?.state === 'hold') {
+        shellSnapshotHold.state = 'discard'
+        shellSnapshotHold.pending = undefined
+      }
       if (hostReady !== undefined && startup === hostReady) startup = undefined
     }
   }
@@ -1005,6 +1052,12 @@ async function main(): Promise<void> {
     }
     if (typeof message !== 'string') throw new Error('dsh desktop: startup failure must be text')
     if (servedCachedShell && desktopBootCanContinue(message)) return
+    // The dying page reports missing revisions while its frame is still current.
+    // Once loadURL replaces that frame, a boot failure is the new page and stays fatal.
+    if (shouldIgnorePluginApplyWebBoot(event.senderFrame, pluginApplyDyingFrame)) {
+      console.warn('dsh desktop: ignoring web-boot failure from the page being replaced')
+      return
+    }
     reportFatal(new Error(message), 'web-boot')
   })
 

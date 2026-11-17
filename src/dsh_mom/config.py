@@ -5,7 +5,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 
 class SettingsError(ValueError):
@@ -99,13 +99,30 @@ def _or_default(value: str | None, default: str) -> str:
     return text or default
 
 
+def _url_for_error(text: str) -> str:
+    """Drop userinfo, query, and fragment before an address is copied into an error.
+
+    A rejected ``ftp://user:secret@host/v1?token=abc`` must not put the password
+    or the query into logs. A path without those parts stays unchanged.
+    """
+    parsed = urlsplit(text)
+    if parsed.username is None and parsed.password is None and not parsed.query and not parsed.fragment:
+        return text
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = host if parsed.port is None else f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
 def _optional_http_url(raw: str | None, name: str) -> str | None:
     text = _blank_to_none(raw)
     if text is None:
         return None
     parsed = urlsplit(text)
     if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-        raise SettingsError(f"{name} 必须是 http 或 https 地址，当前值是 {text!r}。")
+        shown = _url_for_error(text)
+        raise SettingsError(f"{name} 必须是 http 或 https 地址，当前值是 {shown!r}。")
     if parsed.username is not None or parsed.password is not None:
         raise SettingsError(f"{name} 不能在地址中携带账号或密码。")
     return text

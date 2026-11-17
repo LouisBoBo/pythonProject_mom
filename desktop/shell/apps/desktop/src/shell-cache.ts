@@ -293,6 +293,21 @@ export function desktopBootCanContinue(message: string): boolean {
   return lines.length > 0 && lines.every(line => line.includes(': pending (waiting for service'))
 }
 
+/**
+ * Whether a web-boot failure belongs to the page a plugin soft-restart is replacing.
+ * The dying frame still requests the previous combo-batch revisions while the Host is
+ * stopped. That report is not a cold-start fatal. A failure from the replacement frame
+ * is a real boot error and must still reach the fatal dialog.
+ * @param senderFrame - Frame that sent `bootFailed`.
+ * @param dyingFrame - Main frame captured when the soft-restart began, or undefined outside one.
+ */
+export function shouldIgnorePluginApplyWebBoot(
+  senderFrame: object | null | undefined,
+  dyingFrame: object | null | undefined,
+): boolean {
+  return dyingFrame != null && senderFrame === dyingFrame
+}
+
 /** Last locale preference the Host confirmed, so the next paint need not wait for it. */
 export function readDesktopLocalePreference(home: string): string | null {
   try {

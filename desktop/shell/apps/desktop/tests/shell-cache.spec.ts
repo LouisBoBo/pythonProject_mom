@@ -15,6 +15,7 @@ import {
   serveCachedShellScript,
   shellScriptKey,
   shellScriptKeys,
+  shouldIgnorePluginApplyWebBoot,
   writeDesktopShellSnapshot,
 } from '../src/shell-cache.ts'
 
@@ -123,6 +124,15 @@ describe('desktop shell snapshot', () => {
     expect(desktopBootCanContinue(pending)).toBe(true)
     expect(desktopBootCanContinue('web boot: 1 entry did not activate\nlocale: failed')).toBe(false)
     expect(desktopBootCanContinue('web boot: 1 entry did not activate\nlocale: import failed: missing')).toBe(false)
+  })
+
+  it('ignores a web-boot fatal only from the frame being replaced', () => {
+    const dying = {}
+    const replacement = {}
+    expect(shouldIgnorePluginApplyWebBoot(dying, dying)).toBe(true)
+    expect(shouldIgnorePluginApplyWebBoot(replacement, dying)).toBe(false)
+    expect(shouldIgnorePluginApplyWebBoot(dying, undefined)).toBe(false)
+    expect(shouldIgnorePluginApplyWebBoot(null, dying)).toBe(false)
   })
 
   it('reads live revisions from the boot graph', () => {
