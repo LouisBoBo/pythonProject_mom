@@ -22,6 +22,7 @@ apps/desktop/scripts/electron-builder-config.mjs
 apps/desktop/scripts/installer-directories.nsh
 apps/desktop/scripts/installer.nsh
 apps/desktop/scripts/prepare-dsh.ts
+apps/desktop/scripts/prepare-runtime.ts
 apps/desktop/scripts/smoke-packaged-runtime.ts
 apps/desktop/src/client/WelcomePage.tsx
 apps/desktop/src/host-process.ts
@@ -68,8 +69,11 @@ apps/desktop/scripts/render-app-icons.mjs
 apps/desktop/scripts/render-installer-brand.mjs
 apps/desktop/src/company-market.ts
 apps/desktop/tests/company-market.spec.ts
+packages/boot/plugin-manager/src/activation-reload.ts
 packages/boot/plugin-manager/src/company-force-remove.ts
+packages/boot/plugin-manager/src/index.ts
 packages/boot/plugin-manager/src/operations.ts
+packages/boot/plugin-manager/tests/activation-reload.spec.ts
 packages/boot/plugin-manager/tests/company-force-remove.spec.ts
 apps/desktop/src/local-login.ts
 apps/desktop/src/login-enterprises.ts

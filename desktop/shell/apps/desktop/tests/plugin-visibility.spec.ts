@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { bootScriptsChanged, profilePluginSignature, quarantineShadowedRuntimePackages, sanitizeProfileManifestBom, watchProfilePlugins } from '../src/plugin-visibility.ts'
+import { bootScriptsChanged, pluginChangeRestartsWindow, profileManifestEvent, profilePluginSignature, quarantineShadowedRuntimePackages, removedPluginScripts, sanitizeProfileManifestBom, watchProfilePlugins } from '../src/plugin-visibility.ts'
 
 const directories: string[] = []
 
@@ -41,6 +41,37 @@ describe('profile plugin signature', () => {
     expect(bootScriptsChanged(undefined, added)).toBe(false)
     expect(bootScriptsChanged(booted, same)).toBe(false)
     expect(bootScriptsChanged(booted, added)).toBe(true)
+  })
+
+  it('reloads only when the open page still names a plugin the Host dropped', () => {
+    const booted = ['/plugins/@zhongruan/dsh-mom-docs/client.js?rev=1', '/plugins/@zhongruan/dsh-knowledge/client.js?rev=1']
+    const live = [{ src: '/plugins/@zhongruan/dsh-knowledge/client.js?rev=9' }]
+    const revised = [
+      { src: '/plugins/@zhongruan/dsh-mom-docs/client.js?rev=9' },
+      { src: '/plugins/@zhongruan/dsh-knowledge/client.js?rev=9' },
+    ]
+    expect(removedPluginScripts(booted, live)).toBe(true)
+    expect(removedPluginScripts(booted, revised)).toBe(false)
+    expect(removedPluginScripts(undefined, live)).toBe(false)
+    expect(removedPluginScripts(booted, [])).toBe(false)
+  })
+
+  it('reloads the window after a saved install or uninstall', () => {
+    const saved = { ok: true, value: { application: 'applied', changed: true, stage: 'remove' } }
+    expect(pluginChangeRestartsWindow('/api/pluginManager/removeBundle', saved)).toBe(true)
+    expect(pluginChangeRestartsWindow('/api/pluginManager/installBundle', { application: 'restart-required', changed: true })).toBe(true)
+    expect(pluginChangeRestartsWindow('/api/pluginManager/setBundleEnabled', { ok: true, value: { application: 'applied' } })).toBe(false)
+    expect(pluginChangeRestartsWindow('/api/pluginManager/removeBundle', { ok: true, value: { application: 'failed', changed: false, error: { code: 'bundle-in-use' } } })).toBe(false)
+    expect(pluginChangeRestartsWindow('/api/pluginManager/setPluginEnabled', saved)).toBe(false)
+    expect(pluginChangeRestartsWindow('/api/sessions/list', saved)).toBe(false)
+  })
+
+  it('treats an atomic package.json temp name as a manifest event', () => {
+    expect(profileManifestEvent(null)).toBe(true)
+    expect(profileManifestEvent('package.json')).toBe(true)
+    expect(profileManifestEvent('package.json.lock')).toBe(true)
+    expect(profileManifestEvent('package.json.ab12cd.tmp')).toBe(true)
+    expect(profileManifestEvent('cordis.patch.yml')).toBe(false)
   })
 })
 

@@ -1,0 +1,33 @@
+---
+description: 插件安装、卸载、更新已测过，没有新 bug 就不要改
+alwaysApply: true
+---
+
+# 插件安装、卸载、更新已冻结
+
+2026-11-25 本机测过安装、卸载、更新，三步都通过。用户没有指出这三步的新 bug 时，禁止改它们的行为，也禁止顺手重构。
+
+## 冻结范围
+
+- `desktop/shell/apps/desktop/src/main.ts`：`applyInstalledPlugins`、`pluginRequests` 等待、`/api/pluginManager/` 在 Host 未就绪时最多等 20 秒
+- `desktop/shell/apps/desktop/src/plugin-visibility.ts`：`WINDOW_RESTART_METHODS`、`changeWasSaved`、`watchProfilePlugins`
+- `desktop/shell/packages/boot/plugin-manager/src/index.ts` 的 `reload()`，以及 `activation-reload.ts`：裸的 `failed to import` 记为 `restart-required`
+- `@zhongruan/*` 卸载不因 `bundle-in-use` 被拒绝
+
+## 必须保持
+
+- `setBundleEnabled` 不重启窗口。Host 还没就绪时等待，不立刻回 503。
+- 只有 `removeBundle` 和 `installBundle` 会重启窗口。
+- 更新是先卸后装。热重载只报 `failed to import`、后面没有冒号时，结果是 `restart-required`（界面为已安装），不是 `failed`。
+- `failed to import:` 后面带具体错误时，仍然算安装失败。
+- 写进 Profile `package.json` 的版本，市场上必须已有对应 tgz。
+
+## 允许改的唯一情况
+
+用户明确说安装、卸载或更新又坏了，并给出这次的报错原文。只改对上那条报错的一处。改完必须再测安装、卸载、更新。
+
+```text
+❌ 清理 main.ts 时改掉 Host 等待或重启名单
+❌ 把裸的 failed to import 重新当成安装失败
+✅ 用户贴出新的失败原文后，只改对应分支，并重测三步
+```

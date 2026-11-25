@@ -3,8 +3,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  companyPnpmArgs,
   forceRemoveCompanyPlugin,
   isForceRemovableCompanyPackage,
+  releaseCompanyProfileRows,
 } from '../src/company-force-remove.ts'
 
 const directories: string[] = []
@@ -59,5 +61,48 @@ describe('company force remove', () => {
     expect(manifest.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base'])
     expect(existsSync(pkgDir)).toBe(false)
     expect(existsSync(join(directory, 'node_modules', '@zhongruan', 'dsh-cursor-chat_tmp_1'))).toBe(false)
+  })
+
+  it('drops only this package from the profile patch', () => {
+    const directory = profile()
+    writeFileSync(join(directory, 'cordis.patch.yml'), [
+      '- id: plugin-market',
+      '  config:',
+      '    indexes:',
+      '      - http://127.0.0.1:13090/index.json',
+      '- id: key-quota',
+      '  name: "@zhongruan/dsh-key-quota"',
+      '  disabled: false',
+      '  config:',
+      '    role: server',
+      '    port: 18790',
+      '- id: agent-preset-registry',
+      '  name: "@deepseek-ai/dsh-agent-preset-registry"',
+      '',
+    ].join('\n'))
+    expect(releaseCompanyProfileRows(directory, '@zhongruan/dsh-key-quota', [
+      { id: 'key-quota', name: '@zhongruan/dsh-key-quota' },
+    ])).toBe(true)
+    const text = readFileSync(join(directory, 'cordis.patch.yml'), 'utf8')
+    expect(text).not.toContain('key-quota')
+    expect(text).toContain('plugin-market')
+    expect(text).toContain('agent-preset-registry')
+    expect(releaseCompanyProfileRows(directory, '@deepseek-ai/dsh-base', [
+      { id: 'plugin-market', name: '@deepseek-ai/dsh-plugin-market' },
+    ])).toBe(false)
+    expect(readFileSync(join(directory, 'cordis.patch.yml'), 'utf8')).toContain('plugin-market')
+  })
+
+  it('sends company install, update, and uninstall to the market bridge', () => {
+    const bridge = '--config.registry=http://127.0.0.1:13090/npm/'
+    expect(companyPnpmArgs(['add', '@zhongruan/dsh-esc@0.1.62', '--config.registry=https://registry.npmmirror.com/']))
+      .toEqual(['add', '@zhongruan/dsh-esc@0.1.62', bridge])
+    expect(companyPnpmArgs(['update', '@zhongruan/dsh-knowledge@1.0.41', '--registry=https://registry.npmjs.org']))
+      .toEqual(['update', '@zhongruan/dsh-knowledge@1.0.41', bridge])
+    expect(companyPnpmArgs(['remove', '@zhongruan/dsh-cursor-chat', '--config.registry=http://127.0.0.1:13090/npm/']))
+      .toEqual(['remove', '@zhongruan/dsh-cursor-chat', bridge])
+    expect(companyPnpmArgs(['add', '@deepseek-ai/dsh-base', '--config.registry=https://registry.npmmirror.com/']))
+      .toEqual(['add', '@deepseek-ai/dsh-base', '--config.registry=https://registry.npmmirror.com/'])
+    expect(companyPnpmArgs(['add', './local-plugin'])).toEqual(['add', './local-plugin'])
   })
 })

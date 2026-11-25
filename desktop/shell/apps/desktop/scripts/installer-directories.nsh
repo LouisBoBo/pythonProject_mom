@@ -20,15 +20,26 @@ Var dshRecoveryStopped
   Push $2
   StrCpy $0 0
   ${Do}
-    !ifdef APP_EXECUTABLE_FILENAME
-      ${If} ${FileExists} "$PLUGINSDIR\window-frame.dll"
-      ${AndIf} "$dshFinalDirectory" != ""
-        Push $3
-        System::Call '$PLUGINSDIR\window-frame.dll::InstallerCloseApp(w "$dshFinalDirectory\${APP_EXECUTABLE_FILENAME}") i.r3 ?c'
-        System::Call '$PLUGINSDIR\window-frame.dll::InstallerReleaseDirectory(w "${SOURCE}") i.r3 ?c'
-        Pop $3
+    ; This function is compiled before electron-builder defines APP_EXECUTABLE_FILENAME,
+    ; so the release call must not sit behind that define or the built installer omits it.
+    ${If} ${FileExists} "$PLUGINSDIR\window-frame.dll"
+    ${AndIf} "$dshFinalDirectory" != ""
+      Push $3
+      System::Call '$PLUGINSDIR\window-frame.dll::InstallerReleaseDirectory(w "${SOURCE}") i.r3 ?c'
+      ClearErrors
+      FileOpen $2 "$PLUGINSDIR\directory-operations.log" a
+      ${IfNot} ${Errors}
+        FileSeek $2 0 END
+        FileWrite $2 "${PHASE}: release-directory=$3$\r$\n"
+        FileClose $2
       ${EndIf}
-    !endif
+      ${If} $3 > 0
+        Sleep 750
+      ${ElseIf} $3 < 0
+        Sleep 400
+      ${EndIf}
+      Pop $3
+    ${EndIf}
     ${If} "${DESTINATION}" == ""
       System::Call 'kernel32::RemoveDirectoryW(w "${SOURCE}") i.r1 ?e'
     ${Else}
@@ -58,10 +69,10 @@ Var dshRecoveryStopped
       ${ExitDo}
     ${EndIf}
     IntOp $0 $0 + 1
-    ${If} $0 >= 10
+    ${If} $0 >= 20
       ${ExitDo}
     ${EndIf}
-    IntOp $1 $0 * 250
+    IntOp $1 $0 * 300
     Sleep $1
   ${Loop}
   Pop $2

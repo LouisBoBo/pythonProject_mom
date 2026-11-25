@@ -17,7 +17,7 @@ import { awaitTreeGone, leadsOwnGroup, treeAlive, type RunTree } from './run-tre
 import { incompatiblePlugin } from './failure.ts'
 import type { IncompatiblePlugin, PackageResult, Registry } from './types.ts'
 import {
-  companyRemoveRegistry,
+  companyPnpmArgs,
   forceRemoveCompanyPlugin,
   isForceRemovableCompanyPackage,
 } from './company-force-remove.ts'
@@ -295,16 +295,9 @@ function bundleComponentManifests(manifest: ProfileManifest, dir: string, anchor
 export async function runProfilePnpm(
   context: PackageOperationContext, args: readonly string[], options: PackageOperationOptions,
 ): Promise<PackageResult> {
-  // Company remove: prefer the local market bridge so lockfile verification does not
-  // hit public npmmirror for `@zhongruan/*` (ERR_PNPM_FETCH_404 on uninstall/update).
-  let argv: readonly string[] = args
-  if (args[0] === 'remove' && typeof args[1] === 'string' && isForceRemovableCompanyPackage(args[1])) {
-    const bridge = companyRemoveRegistry()
-    const withoutRegistry = args.filter((argument) => (
-      !argument.startsWith('--registry=') && !argument.startsWith('--config.registry=')
-    ))
-    argv = [...withoutRegistry, `--config.registry=${bridge}`]
-  }
+  // Company add/update/remove: public mirrors 404 `@zhongruan/*`. Use the market
+  // bridge unless the caller already named a private registry.
+  const argv = companyPnpmArgs(args)
   const dir = context.dir ?? resolveProfileDir(context.profile, context.home)
   // Before any profile file is read: a recorded run that is still active may be rewriting them.
   const active = await activeRecordedRun(dir)

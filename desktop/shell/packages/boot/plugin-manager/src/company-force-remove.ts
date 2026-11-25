@@ -19,6 +19,132 @@ export function isForceRemovableCompanyPackage(name: string): boolean {
   return typeof name === 'string' && name.startsWith('@zhongruan/')
 }
 
+/** A bundle row the uninstall check compares with a live loader entry. */
+export interface CompanyBundleRow {
+  readonly id?: string
+  readonly name?: string
+}
+
+/**
+ * Drop this package's rows from the profile user patch.
+ *
+ * `cordis.patch.yml` is applied after every bundle. An entry that names the
+ * same component stays mounted after the bundle is deselected, and uninstall
+ * then stops with `bundle-in-use` before pnpm runs. Only blocks whose id is
+ * one of this package's rows and whose module name is this package (or is
+ * omitted) are removed. Other plugins in the same file stay.
+ * @returns Whether the patch file changed.
+ */
+export function releaseCompanyProfileRows(
+  profileDir: string,
+  packageName: string,
+  rows: readonly CompanyBundleRow[],
+): boolean {
+  if (!isForceRemovableCompanyPackage(packageName)) return false
+  const ids = new Set(rows.flatMap(row => typeof row.id === 'string' && row.id.length > 0 ? [row.id] : []))
+  if (ids.size === 0 || !profileDir) return false
+  const patchPath = join(profileDir, 'cordis.patch.yml')
+  if (!existsSync(patchPath)) return false
+  const text = readFileSync(patchPath, 'utf8')
+  const next = stripProfileRows(text, ids, packageName, rows)
+  if (next === text) return false
+  writeFileSync(patchPath, next)
+  return true
+}
+
+function stripProfileRows(
+  text: string,
+  ids: ReadonlySet<string>,
+  packageName: string,
+  rows: readonly CompanyBundleRow[],
+): string {
+  const newline = text.includes('\r\n') ? '\r\n' : '\n'
+  const lines = text.split(/\r?\n/)
+  const out: string[] = []
+  let index = 0
+  while (index < lines.length) {
+    const id = topLevelId(lines[index])
+    if (id === undefined) {
+      out.push(lines[index] ?? '')
+      index += 1
+      continue
+    }
+    let end = index + 1
+    while (end < lines.length && topLevelId(lines[end]) === undefined) end += 1
+    const block = lines.slice(index, end)
+    if (!ids.has(id) || !blockNamesPackage(block, packageName, id, rows)) {
+      out.push(...block)
+    }
+    index = end
+  }
+  let joined = out.join(newline)
+  if (text.endsWith('\n') && !joined.endsWith('\n')) joined += newline
+  if (text.endsWith('\n\n') && joined.endsWith('\n') && !joined.endsWith('\n\n')) joined += newline
+  return joined
+}
+
+function topLevelId(line: string | undefined): string | undefined {
+  const match = /^-\s+id:\s*(['"]?)([^'"\s#]+)\1\s*$/.exec(line ?? '')
+  return match?.[2]
+}
+
+function blockNamesPackage(
+  block: readonly string[],
+  packageName: string,
+  id: string,
+  rows: readonly CompanyBundleRow[],
+): boolean {
+  const named = block.flatMap(line => {
+    const match = /^\s+name:\s*(['"]?)([^'"\s#]+)\1\s*$/.exec(line)
+    return match?.[2] === undefined ? [] : [match[2]]
+  })
+  if (named.length === 0) return true
+  if (named.includes(packageName)) return true
+  return named.some(name => rows.some(row => row.id === id && row.name === name))
+}
+
+const PUBLIC_REGISTRIES = new Set([
+  'https://registry.npmmirror.com',
+  'https://registry.npmjs.org',
+])
+
+function registryBase(url: string): string {
+  return url.trim().replace(/\/+$/u, '')
+}
+
+/**
+ * The `@zhongruan/*` spec named by add, remove, or update, without a version.
+ * Path, link, and URL specs stay with the registry the caller asked.
+ */
+export function companyPackageSpec(args: readonly string[]): string | undefined {
+  const commandAt = args.findIndex(argument => !argument.startsWith('-'))
+  const command = args[commandAt]
+  if (command !== 'add' && command !== 'remove' && command !== 'update' && command !== 'up') return undefined
+  const spec = args.slice(commandAt + 1).find(argument => !argument.startsWith('-'))
+  if (spec === undefined || spec.startsWith('.') || spec.startsWith('file:') || spec.startsWith('link:') || spec.includes('://')) {
+    return undefined
+  }
+  const name = spec.startsWith('@') ? `@${spec.slice(1).split('@')[0] ?? ''}` : spec.split('@')[0] ?? ''
+  return isForceRemovableCompanyPackage(name) ? name : undefined
+}
+
+/**
+ * Point a company install, update, or uninstall at the market bridge when the
+ * caller asked the public npm registry or npmmirror. Those mirrors answer 404
+ * for `@zhongruan/*`. A registry that is already the bridge, or another private
+ * registry, is kept.
+ */
+export function companyPnpmArgs(args: readonly string[]): readonly string[] {
+  if (companyPackageSpec(args) === undefined) return args
+  const flag = args.find(argument => argument.startsWith('--config.registry=') || argument.startsWith('--registry='))
+  const given = flag === undefined ? '' : flag.slice(flag.indexOf('=') + 1)
+  const givenBase = registryBase(given)
+  const useGiven = givenBase.length > 0 && !PUBLIC_REGISTRIES.has(givenBase)
+  const registry = useGiven ? (given.endsWith('/') ? given : `${givenBase}/`) : companyRemoveRegistry()
+  const without = args.filter(argument => !argument.startsWith('--registry=') && !argument.startsWith('--config.registry='))
+  return [...without, `--config.registry=${registry}`]
+}
+
 /** Registry URL to prefer for company package remove (bridge proxies company + public). */
 export function companyRemoveRegistry(): string {
   const fromEnv = (process.env.ZR_DSH_COMPANY_NPM ?? process.env.ZR_DSH_MARKET_NPM ?? '').trim()

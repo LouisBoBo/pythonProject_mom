@@ -87,6 +87,78 @@ export function bootScriptsChanged(booted: readonly string[] | undefined, inject
   return !sameScriptKeyList(booted, shellScriptKeys(injections))
 }
 
+const SCRIPT_PACKAGE = /@[\w.-]+\/[\w.-]+/gu
+
+/** Package names named by plugin script URLs. Revision query changes are ignored. */
+export function scriptPackages(keys: readonly string[]): Set<string> {
+  const names = new Set<string>()
+  for (const key of keys) {
+    for (const match of key.matchAll(SCRIPT_PACKAGE)) names.add(match[0])
+  }
+  return names
+}
+
+/**
+ * Whether the open page still has a plugin script the live Host no longer serves.
+ * A revision-only change is not a removal. An empty live list is not a removal:
+ * the Host has not published its graph yet.
+ * @param booted - Script keys the open page already loaded.
+ * @param injections - Live Host boot rows.
+ */
+export function removedPluginScripts(booted: readonly string[] | undefined, injections: readonly unknown[]): boolean {
+  if (booted === undefined) return false
+  const live = scriptPackages(shellScriptKeys(injections))
+  if (live.size === 0) return false
+  for (const name of scriptPackages(booted)) {
+    if (!live.has(name)) return true
+  }
+  return false
+}
+
+const WINDOW_RESTART_METHODS = new Set(['removeBundle', 'installBundle'])
+
+/**
+ * Plugin-manager method named by a desktop API path, such as `/api/pluginManager/removeBundle`.
+ * @param pathname - Request path.
+ * @returns the method, or undefined when the path is not a plugin-manager call.
+ */
+export function pluginManagerMethod(pathname: string): string | undefined {
+  const prefix = '/api/pluginManager/'
+  if (!pathname.startsWith(prefix)) return undefined
+  const method = pathname.slice(prefix.length).split('/')[0]
+  return method === '' ? undefined : method
+}
+
+function changeWasSaved(body: unknown): boolean {
+  if (typeof body !== 'object' || body === null) return false
+  const record = body as { ok?: unknown, value?: unknown, application?: unknown, changed?: unknown }
+  if (record.application === 'applied' || record.application === 'restart-required' || record.changed === true) return true
+  return record.ok === true && changeWasSaved(record.value)
+}
+
+/**
+ * Whether this plugin-manager response should reload the open window.
+ * Install, uninstall, and enable write the profile and used to restart the
+ * window from the package.json watch. A row toggle only edits the user patch.
+ * @param pathname - Request path.
+ * @param body - JSON answer, either the change itself or `{ ok, value }`.
+ */
+export function pluginChangeRestartsWindow(pathname: string, body: unknown): boolean {
+  const method = pluginManagerMethod(pathname)
+  if (method === undefined || !WINDOW_RESTART_METHODS.has(method)) return false
+  return changeWasSaved(body)
+}
+
+/**
+ * Whether a directory watch event can be the profile manifest.
+ * Atomic writes land as `package.json.<hex>.tmp` and Windows often reports only that name.
+ * @param filename - Event file name, or null for a directory-level event.
+ */
+export function profileManifestEvent(filename: string | null): boolean {
+  if (filename === null) return true
+  return filename === 'package.json' || filename === 'package.json.lock' || filename.startsWith('package.json.')
+}
+
 /**
  * Move profile copies of the installation's runtime packages aside when their version differs.
  * Node resolves profile packages before the runtime resolution, so a plugin that pins a private
@@ -186,7 +258,7 @@ export function watchProfilePlugins(
   }
   try {
     watcher = watch(profileDir, { persistent: false }, (_event, filename) => {
-      if (filename !== null && filename !== 'package.json' && filename !== 'package.json.lock') return
+      if (!profileManifestEvent(filename)) return
       schedule()
     })
   } catch {

@@ -42,11 +42,47 @@ export function companyMarketScript(packaged: boolean, resourcesPath: string): s
  * Existing profile files are kept; the index URL is added once.
  * @param profileDir - Desktop profile directory.
  */
+/** Company tarball URLs baked into a lockfile before the registry moved off the TLS port. */
+const COMPANY_LOCK_TARBALL = /https?:\/\/175\.178\.238\.31(?::8443)?\/dsh-plugins\/npm\//g
+
+/**
+ * Point lockfile tarballs at the local bridge.
+ * An absolute `https://…:8443/…tgz` is fetched by pnpm itself, so a reset on
+ * that port fails uninstall and update even when the bridge can still serve
+ * the package.
+ * @param lockText - `pnpm-lock.yaml` contents.
+ * @param localNpm - Bridge npm URL.
+ * @returns the lockfile text, unchanged when it names no company tarball.
+ */
+export function rewriteCompanyLockTarballs(lockText: string, localNpm: string = COMPANY_MARKET_NPM): string {
+  const local = `${String(localNpm).replace(/\/+$/u, '')}/`
+  return lockText.replace(COMPANY_LOCK_TARBALL, local)
+}
+
+/**
+ * Rewrite company tarball URLs in the profile lockfile.
+ * Skips the write while pnpm holds `package.json.lock`.
+ * @param profileDir - Desktop profile directory.
+ * @param localNpm - Bridge npm URL.
+ * @returns whether the lockfile was rewritten.
+ */
+export function healCompanyLockfile(profileDir: string, localNpm: string = COMPANY_MARKET_NPM): boolean {
+  if (!profileDir || !existsSync(profileDir)) return false
+  const lockPath = join(profileDir, 'pnpm-lock.yaml')
+  if (!existsSync(lockPath) || existsSync(join(profileDir, 'package.json.lock'))) return false
+  const body = readFileSync(lockPath, 'utf8')
+  const next = rewriteCompanyLockTarballs(body, localNpm)
+  if (next === body) return false
+  writeFileSync(lockPath, next)
+  return true
+}
+
 export function ensureCompanyMarketProfile(profileDir: string): void {
   try {
     writeCompanyMarketProfile(profileDir)
     ensureCompanyMarketNpmrc(profileDir)
     ensureCompanyReleaseAgeExclude(profileDir)
+    healCompanyLockfile(profileDir)
   } catch (error) {
     console.error('desktop company market profile was not updated', error)
   }

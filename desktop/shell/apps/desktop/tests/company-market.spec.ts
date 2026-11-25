@@ -9,6 +9,7 @@ import {
   ensureCompanyMarketNpmrc,
   ensureCompanyMarketProfile,
   ensureCompanyReleaseAgeExclude,
+  rewriteCompanyLockTarballs,
 } from '../src/company-market.ts'
 
 const directories: string[] = []
@@ -58,6 +59,19 @@ describe('company market profile heal', () => {
     expect(npmrc).toContain('@zhongruan:registry=')
   })
 
+  it('rewrites company tarball URLs off the TLS port that resets', () => {
+    const before = [
+      'tarball: https://175.178.238.31:8443/dsh-plugins/npm/@zhongruan/dsh-esc/-/dsh-esc-0.1.62.tgz',
+      'tarball: http://175.178.238.31/dsh-plugins/npm/@zhongruan/dsh-knowledge/-/dsh-knowledge-1.0.41.tgz',
+      'tarball: https://registry.npmmirror.com/@deepseek-ai/cordis/-/cordis-4.1.0.tgz',
+    ].join('\n')
+    const after = rewriteCompanyLockTarballs(before)
+    expect(after).toContain('tarball: http://127.0.0.1:13090/npm/@zhongruan/dsh-esc/-/dsh-esc-0.1.62.tgz')
+    expect(after).toContain('tarball: http://127.0.0.1:13090/npm/@zhongruan/dsh-knowledge/-/dsh-knowledge-1.0.41.tgz')
+    expect(after).toContain('tarball: https://registry.npmmirror.com/@deepseek-ai/cordis/-/cordis-4.1.0.tgz')
+    expect(rewriteCompanyLockTarballs(after)).toBe(after)
+  })
+
   it('ensureCompanyMarketProfile heals npmrc and workspace when package.json exists', () => {
     const directory = profile()
     writeFileSync(
@@ -65,7 +79,10 @@ describe('company market profile heal', () => {
       `${JSON.stringify({ dsh: { profile: { bundles: [] } } }, undefined, 2)}\n`,
     )
     writeFileSync(join(directory, 'cordis.patch.yml'), '[]\n')
+    writeFileSync(join(directory, 'pnpm-lock.yaml'), 'tarball: https://175.178.238.31:8443/dsh-plugins/npm/@zhongruan/dsh-esc/-/dsh-esc-0.1.62.tgz\n')
     ensureCompanyMarketProfile(directory)
+    expect(readFileSync(join(directory, 'pnpm-lock.yaml'), 'utf8')).toContain('http://127.0.0.1:13090/npm/@zhongruan/dsh-esc/-/dsh-esc-0.1.62.tgz')
+    expect(readFileSync(join(directory, 'pnpm-lock.yaml'), 'utf8')).not.toContain(':8443/')
     expect(existsSync(join(directory, '.npmrc'))).toBe(true)
     expect(readFileSync(join(directory, '.npmrc'), 'utf8')).toContain('@zhongruan:registry=')
     expect(existsSync(join(directory, 'pnpm-workspace.yaml'))).toBe(true)

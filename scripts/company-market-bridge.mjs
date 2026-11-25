@@ -3,9 +3,9 @@
  * Catalog: https://175.178.238.31:8443/dsh-plugins/plugins.json
  * npm:     https://175.178.238.31:8443/dsh-plugins/npm/
  *
- * The market files are served by the gateway's own TLS entry, not by port 80:
- * the shared box gives 80 to whatever site is deployed there, and the catalog
- * would silently start returning someone else's 404 page.
+ * The market files are served by the gateway's own TLS entry. When that entry
+ * resets the connection, the same path is read from port 80 and kept only when
+ * the body is a package document, not whatever other site is bound there.
  *
  * This bridge only adapts market metadata. Plugin behavior/UI fixes belong in
  * each plugin's own repository — do not patch plugin code from this repo.
@@ -14,7 +14,7 @@ import { lookup as dnsLookup } from 'node:dns/promises'
 import { createServer, request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { Readable } from 'node:stream'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -30,9 +30,30 @@ const OUT = process.env.ZR_DSH_MARKET_OUT
   ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'var', 'company-market', 'index.json')
 
 async function fetchJson(url) {
-  const res = await fetch(url, { redirect: 'error' })
+  const res = await fetchCompanyFirst(url, 'application/json')
   if (!res.ok) throw new Error(`${url} → ${res.status}`)
   return res.json()
+}
+
+async function fetchCompanyFirst(url, accept) {
+  try {
+    const res = await fetch(url, { headers: { accept, 'accept-encoding': 'identity' }, redirect: 'error' })
+    if (res.status < 500) return res
+    await res.body?.cancel()
+  } catch (error) {
+    if (!transientNetworkError(error)) throw error
+  }
+  const fallback = companyHttpFallback(url)
+  if (fallback === undefined) throw new Error(`${url} → company registry failed`)
+  const res = await fetch(fallback, { headers: { accept, 'accept-encoding': 'identity' }, redirect: 'error' })
+  const body = Buffer.from(await res.arrayBuffer())
+  if (!companyDocument(res.headers.get('content-type'), body)) {
+    throw new Error('company http fallback was not a package document')
+  }
+  return new Response(body, {
+    status: res.status,
+    headers: { 'content-type': res.headers.get('content-type') ?? 'application/json' },
+  })
 }
 
 function publishSeconds(iso) {
@@ -95,6 +116,117 @@ export function npmProxyTarget(requestPath, companyRegistry = NPM, publicRegistr
     throw new Error('rejected npm path')
   }
   return target.href
+}
+
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE',
+  'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+])
+
+/**
+ * Whether a fetch failed before an HTTP answer, the way the company TLS port resets.
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function transientNetworkError(error) {
+  const cause = error instanceof Error && 'cause' in error ? error.cause : undefined
+  const code = (cause && typeof cause === 'object' && 'code' in cause && cause.code)
+    || (error instanceof Error && 'code' in error && error.code)
+    || ''
+  if (TRANSIENT_NETWORK_CODES.has(String(code))) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return message === 'fetch failed' || message.includes('socket hang up')
+}
+
+/**
+ * The plain-HTTP copy of one company URL.
+ * The TLS entry is the one the catalog publishes. Port 80 is the same path on
+ * the same host, used only after that entry fails.
+ * @param {string} url
+ * @returns {string | undefined}
+ */
+export function companyHttpFallback(url) {
+  let parsed
+  try { parsed = new URL(url) } catch { return undefined }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return undefined
+  parsed.protocol = 'http:'
+  parsed.port = ''
+  return parsed.href
+}
+
+/**
+ * Whether a port-80 answer is a package document rather than another site's page.
+ * @param {string | null} contentType
+ * @param {Buffer | Uint8Array} body
+ * @returns {boolean}
+ */
+export function companyDocument(contentType, body) {
+  const type = String(contentType ?? '').toLowerCase()
+  if (type.includes('text/html')) return false
+  const bytes = Buffer.from(body)
+  if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) return true
+  let parsed
+  try { parsed = JSON.parse(bytes.toString('utf8')) } catch { return false }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+  if (typeof parsed.name === 'string') return true
+  if (parsed.versions !== null && typeof parsed.versions === 'object') return true
+  if (Array.isArray(parsed.plugins)) return true
+  return false
+}
+
+/**
+ * A company tarball URL rewritten onto the local bridge, so pnpm does not
+ * download it from the TLS port that resets.
+ * @param {string} tarball
+ * @param {string} localNpm
+ * @param {readonly string[]} bases company registry URLs, with or without a trailing slash
+ * @returns {string | undefined}
+ */
+export function localTarballUrl(tarball, localNpm, bases) {
+  let url
+  try { url = new URL(tarball) } catch { return undefined }
+  const local = new URL(localNpm.endsWith('/') ? localNpm : `${localNpm}/`)
+  for (const base of bases) {
+    const root = new URL(base.endsWith('/') ? base : `${base}/`)
+    if (url.origin !== root.origin || !url.pathname.startsWith(root.pathname)) continue
+    const rewritten = new URL(url.pathname.slice(root.pathname.length), local)
+    // A path like `npm///other-host/...` is protocol-relative and would leave the bridge.
+    if (rewritten.origin !== local.origin || !rewritten.pathname.startsWith(local.pathname)) return undefined
+    return rewritten.href
+  }
+  return undefined
+}
+
+/**
+ * Point every version's tarball at the local bridge.
+ * @param {object} packument
+ * @param {string} localNpm
+ * @param {readonly string[]} bases
+ * @returns {object}
+ */
+export function rewritePackumentTarballs(packument, localNpm, bases) {
+  const versions = packument?.versions
+  if (versions === null || typeof versions !== 'object') return packument
+  // The bridge is also the profile's default registry, so public packuments must
+  // keep the tarball URL pnpm already locked. Only a company package is rewritten.
+  const company = typeof packument.name === 'string' && packument.name.startsWith('@zhongruan/')
+  if (!company) return packument
+  for (const version of Object.values(versions)) {
+    const dist = version?.dist
+    if (dist === null || typeof dist !== 'object' || typeof dist.tarball !== 'string') continue
+    const local = localTarballUrl(dist.tarball, localNpm, bases)
+    // A company packument must not send pnpm to another host. Drop the URL instead.
+    if (local !== undefined) dist.tarball = local
+    else delete dist.tarball
+  }
+  return packument
+}
+
+function companyRegistryBases(companyRegistry = NPM) {
+  const bases = [companyRegistry]
+  const http = companyHttpFallback(companyRegistry)
+  if (http !== undefined) bases.push(http)
+  return bases
 }
 
 /** Decide whether a hostname resolves to a private, loopback, or otherwise blocked address.
@@ -255,7 +387,7 @@ export async function publicRedirectTarget(location, current, lookup = defaultDn
   return href
 }
 
-async function fetchPublic(target, accept) {
+async function fetchPublicHops(target, accept) {
   let current = target
   /** @type {string[] | undefined} */
   let pin
@@ -274,6 +406,30 @@ async function fetchPublic(target, accept) {
     current = next.href
   }
   throw new Error('rejected redirect')
+}
+
+async function fetchPublic(target, accept) {
+  const companyOrigin = new URL(NPM).origin
+  let targetOrigin = ''
+  try { targetOrigin = new URL(target).origin } catch { /* handled by the hop fetch */ }
+  const canFallBack = targetOrigin === companyOrigin && companyHttpFallback(target) !== undefined
+  try {
+    const upstream = await fetchPublicHops(target, accept)
+    if (!canFallBack || upstream.status < 500) return upstream
+    await upstream.body?.cancel()
+  } catch (error) {
+    if (!canFallBack || !transientNetworkError(error)) throw error
+  }
+  const fallback = companyHttpFallback(target)
+  const upstream = await fetchPublicHops(fallback, accept)
+  const body = Buffer.from(await upstream.arrayBuffer())
+  if (!companyDocument(upstream.headers.get('content-type'), body)) {
+    throw new Error('company http fallback was not a package document')
+  }
+  return new Response(body, {
+    status: upstream.status,
+    headers: { 'content-type': upstream.headers.get('content-type') ?? 'application/octet-stream' },
+  })
 }
 
 /** http(s) link safe to publish, or undefined when the catalog value is not one. */
@@ -378,17 +534,51 @@ async function buildIndex() {
 }
 
 let cache = { at: 0, body: '' }
-const TTL_MS = 60_000
+let refreshing = null
+const TTL_MS = 5 * 60_000
+
+function rememberIndex(body) {
+  cache = { at: Date.now(), body }
+}
+
+function loadStoredIndex() {
+  try {
+    const body = readFileSync(OUT, 'utf8')
+    const parsed = JSON.parse(body)
+    if (parsed?.format === 1 && Array.isArray(parsed.plugins)) rememberIndex(body.endsWith('\n') ? body : `${body}\n`)
+  } catch {
+    // The first launch has no saved index yet.
+  }
+}
+
+async function refreshIndex() {
+  if (refreshing) return refreshing
+  refreshing = (async () => {
+    try {
+      const index = await buildIndex()
+      const body = `${JSON.stringify(index, null, 2)}\n`
+      rememberIndex(body)
+      mkdirSync(dirname(OUT), { recursive: true })
+      writeFileSync(OUT, body)
+      console.log(`index plugins=${index.plugins.length} → ${OUT}`)
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      refreshing = null
+    }
+  })()
+  return refreshing
+}
 
 async function indexBody() {
-  if (Date.now() - cache.at < TTL_MS && cache.body) return cache.body
-  const index = await buildIndex()
-  const body = `${JSON.stringify(index, null, 2)}\n`
-  cache = { at: Date.now(), body }
-  mkdirSync(dirname(OUT), { recursive: true })
-  writeFileSync(OUT, body)
-  console.log(`index plugins=${index.plugins.length} → ${OUT}`)
-  return body
+  if (cache.body && Date.now() - cache.at < TTL_MS) return cache.body
+  if (cache.body) {
+    void refreshIndex()
+    return cache.body
+  }
+  await refreshIndex()
+  if (!cache.body) throw new Error('market index is unavailable')
+  return cache.body
 }
 
 const invokedDirectly = process.argv[1] !== undefined
@@ -421,15 +611,25 @@ if (invokedDirectly) {
     if (req.method === 'GET' && path.startsWith('/npm/')) {
       const target = npmProxyTarget(path)
       const upstream = await fetchPublic(target, req.headers.accept ?? '*/*')
-      res.writeHead(upstream.status, {
-        'content-type': upstream.headers.get('content-type') ?? 'application/octet-stream',
-        'cache-control': 'no-store',
-      })
-      if (upstream.body === null) {
-        res.end()
-        return
+      const type = upstream.headers.get('content-type') ?? 'application/octet-stream'
+      let body = Buffer.from(await upstream.arrayBuffer())
+      let contentType = type
+      if (upstream.ok && type.includes('json') && !path.includes('/-/')) {
+        try {
+          const packument = JSON.parse(body.toString('utf8'))
+          rewritePackumentTarballs(packument, LOCAL_NPM, companyRegistryBases())
+          body = Buffer.from(JSON.stringify(packument))
+          contentType = 'application/json; charset=utf-8'
+        } catch {
+          // A non-packument JSON body is forwarded as the registry sent it.
+        }
       }
-      Readable.fromWeb(upstream.body).pipe(res)
+      res.writeHead(upstream.status, {
+        'content-type': contentType,
+        'cache-control': 'no-store',
+        'content-length': String(body.length),
+      })
+      res.end(body)
       return
     }
     res.writeHead(404)
@@ -442,6 +642,8 @@ if (invokedDirectly) {
   }
 })
 
+loadStoredIndex()
+void refreshIndex()
 server.listen(PORT, HOST, () => {
   console.log(`company market bridge http://${HOST}:${PORT}/index.json`)
   console.log(`catalog ${CATALOG}`)

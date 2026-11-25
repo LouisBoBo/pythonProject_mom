@@ -175,48 +175,115 @@ static void InstallerCollectFiles(const std::wstring& root, const std::wstring& 
     for (const std::wstring& child : children) InstallerCollectFiles(root, child, files, limit);
 }
 
-// Only stop a same-session program whose image is outside Windows and the other
-// protected roots. Services, Explorer, and critical processes keep their files open.
+static bool InstallerRestartManagerAppType(RM_APP_TYPE type) {
+    switch (type) {
+    case RmUnknownApp:
+    case RmMainWindow:
+    case RmOtherWindow:
+    case RmConsole:
+        return true;
+    case RmCritical:
+        // Console helpers are often tagged RmCritical even when they are ordinary
+        // user processes. Still consider them; IsProcessCritical gates the kill.
+        return true;
+    case RmService:
+    case RmExplorer:
+    default:
+        return false;
+    }
+}
+
+static bool InstallerProcessImageAllowed(HANDLE process, std::wstring* imagePath) {
+    WCHAR image[32768];
+    DWORD count = ARRAYSIZE(image);
+    if (!QueryFullProcessImageNameW(process, 0, image, &count)) return false;
+    BOOL critical = FALSE;
+    std::wstring path;
+    if ((IsProcessCritical(process, &critical) && critical)
+        || !uninstall_data::Normalize(image, path) || InstallerProtectedPath(path)) return false;
+    if (imagePath != nullptr) *imagePath = path;
+    return true;
+}
+
+// Stop same-session programs holding install-tree files. Services, Explorer, critical
+// processes, and images under Windows / shell roots are left alone. Electron editors
+// often keep sibling processes alive after one PID exits, so matching images are
+// cleared next; RmShutdown then forces any remaining Restart Manager targets.
 static int InstallerStopLockingProcesses(const std::vector<RM_PROCESS_INFO>& processes) {
     DWORD selfSession = 0;
     if (!ProcessIdToSessionId(GetCurrentProcessId(), &selfSession) || selfSession == 0) return 0;
     const DWORD self = GetCurrentProcessId();
     int stopped = 0;
+    std::vector<std::wstring> images;
     for (const RM_PROCESS_INFO& info : processes) {
-        switch (info.ApplicationType) {
-        case RmService:
-        case RmExplorer:
-        case RmCritical:
-            continue;
-        case RmUnknownApp:
-        case RmMainWindow:
-        case RmOtherWindow:
-        case RmConsole:
-            break;
-        default:
-            continue;
-        }
+        if (!InstallerRestartManagerAppType(info.ApplicationType)) continue;
         if (info.TSSessionId != selfSession) continue;
         const DWORD pid = static_cast<DWORD>(info.Process.dwProcessId);
         if (pid == 0 || pid == self) continue;
         const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
         if (process == nullptr) continue;
-        WCHAR image[32768];
-        DWORD count = ARRAYSIZE(image);
-        bool allowed = false;
-        if (QueryFullProcessImageNameW(process, 0, image, &count)) {
-            BOOL critical = FALSE;
-            std::wstring path;
-            if (!(IsProcessCritical(process, &critical) && critical)
-                && uninstall_data::Normalize(image, path) && !InstallerProtectedPath(path)) allowed = true;
-        }
+        std::wstring path;
+        const bool allowed = InstallerProcessImageAllowed(process, &path);
         if (allowed && TerminateProcess(process, 1)) {
-            WaitForSingleObject(process, 2000);
+            WaitForSingleObject(process, 4000);
             stopped += 1;
+            if (!path.empty()) {
+                bool known = false;
+                for (const std::wstring& existing : images) {
+                    if (_wcsicmp(existing.c_str(), path.c_str()) == 0) { known = true; break; }
+                }
+                if (!known) images.push_back(path);
+            }
         }
         CloseHandle(process);
     }
+    if (!images.empty()) {
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W entry = {};
+            entry.dwSize = sizeof(entry);
+            for (BOOL present = Process32FirstW(snapshot, &entry); present; present = Process32NextW(snapshot, &entry)) {
+                const DWORD pid = entry.th32ProcessID;
+                if (pid == 0 || pid == self) continue;
+                DWORD session = 0;
+                if (!ProcessIdToSessionId(pid, &session) || session != selfSession) continue;
+                const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+                if (process == nullptr) continue;
+                std::wstring path;
+                if (InstallerProcessImageAllowed(process, &path)) {
+                    bool match = false;
+                    for (const std::wstring& image : images) {
+                        if (_wcsicmp(image.c_str(), path.c_str()) == 0) { match = true; break; }
+                    }
+                    if (match && TerminateProcess(process, 1)) {
+                        WaitForSingleObject(process, 4000);
+                        stopped += 1;
+                    }
+                }
+                CloseHandle(process);
+            }
+            CloseHandle(snapshot);
+        }
+    }
     return stopped;
+}
+
+static void InstallerWaitForLockingProcesses(const std::vector<RM_PROCESS_INFO>& processes) {
+    HANDLE handles[MAXIMUM_WAIT_OBJECTS];
+    DWORD count = 0;
+    for (const RM_PROCESS_INFO& info : processes) {
+        if (count == MAXIMUM_WAIT_OBJECTS) break;
+        if (!InstallerRestartManagerAppType(info.ApplicationType)) continue;
+        const DWORD pid = static_cast<DWORD>(info.Process.dwProcessId);
+        if (pid == 0) continue;
+        const HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (process == nullptr) continue;
+        handles[count] = process;
+        count += 1;
+    }
+    if (count == 0) return;
+    WaitForMultipleObjects(count, handles, TRUE, 8000);
+    for (DWORD index = 0; index < count; index += 1) CloseHandle(handles[index]);
 }
 
 static int InstallerReleaseDirectoryBody(LPCWSTR directory);
@@ -239,12 +306,16 @@ static int InstallerReleaseDirectoryBody(LPCWSTR directory) {
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0
         || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return 0;
     std::vector<std::wstring> files;
+    const size_t fileLimit = 512;
+    // Prefer the payload archive and primary executable; editors commonly keep these open.
     const std::wstring asar = root + L"\\resources\\app.asar";
     const DWORD asarAttributes = GetFileAttributesW((L"\\\\?\\" + asar).c_str());
     if (asarAttributes != INVALID_FILE_ATTRIBUTES
         && (asarAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) == 0)
-        InstallerRememberFile(asar, files, 256);
-    InstallerCollectFiles(root, root, files, 256);
+        InstallerRememberFile(asar, files, fileLimit);
+    // Register files only. Including the directory itself makes RmGetList return
+    // ERROR_ACCESS_DENIED on current Windows builds and aborts the release path.
+    InstallerCollectFiles(root, root, files, fileLimit);
     if (files.empty()) return 0;
     InstallerRmSession session;
     if (!session.start()) return -1;
@@ -258,13 +329,25 @@ static int InstallerReleaseDirectoryBody(LPCWSTR directory) {
     DWORD reasons = 0;
     result = RmGetList(session.value, &needed, &count, nullptr, &reasons);
     if (result == ERROR_SUCCESS) return 0;
-    if (result != ERROR_MORE_DATA || needed == 0 || needed > 64) return -1;
+    if (result != ERROR_MORE_DATA || needed == 0) return -1;
+    if (needed > 256) needed = 256;
     std::vector<RM_PROCESS_INFO> processes(needed);
     count = needed;
     result = RmGetList(session.value, &needed, &count, processes.data(), &reasons);
-    if (result != ERROR_SUCCESS || count > processes.size()) return -1;
+    if (result != ERROR_SUCCESS && result != ERROR_MORE_DATA) return -1;
+    if (count > processes.size()) count = static_cast<UINT>(processes.size());
     processes.resize(count);
-    return InstallerStopLockingProcesses(processes);
+    int stopped = InstallerStopLockingProcesses(processes);
+    // Restart Manager shutdown is scoped to holders of the registered install-tree
+    // resources (junctions are not followed). Use it after TerminateProcess so
+    // multi-process editors such as Cursor release app.asar before MoveFileExW.
+    const DWORD shutdown = RmShutdown(session.value, RmForceShutdown, nullptr);
+    if (shutdown == ERROR_SUCCESS || shutdown == ERROR_FAIL_RESTART || shutdown == ERROR_CANCELLED) {
+        InstallerWaitForLockingProcesses(processes);
+        if (stopped < static_cast<int>(count)) stopped = static_cast<int>(count);
+    }
+    Sleep(500);
+    return stopped;
 }
 
 // Match the affected executable, not another user's or directory's same-named application.

@@ -55,7 +55,7 @@ import {
   writeDesktopShellSnapshot,
   type DesktopShellSnapshot,
 } from './shell-cache.ts'
-import { bootScriptsChanged, quarantineShadowedRuntimePackages, sanitizeProfileManifestBom, watchProfilePlugins } from './plugin-visibility.ts'
+import { bootScriptsChanged, pluginChangeRestartsWindow, quarantineShadowedRuntimePackages, removedPluginScripts, sanitizeProfileManifestBom, watchProfilePlugins } from './plugin-visibility.ts'
 import { DesktopFatalRecovery } from './fatal-recovery.ts'
 import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
 import { mountWelcomeView, type WelcomeSurface } from './welcome-window.ts'
@@ -605,11 +605,17 @@ async function main(): Promise<void> {
     return next.promise
   }
   // The page often paints from the previous shell snapshot before the Host is ready.
-  // When the live script list differs, keep that page. Reloading here paints the
-  // startup screen again after data sync has already succeeded.
+  // A newly added plugin can wait for the next full load. A plugin the open page
+  // still shows, after it was uninstalled, must load again: otherwise its screen
+  // stays up and every read fails against the removed service.
   const refreshRunningShell = (): void => {
     if (pluginApply || quitting || shuttingDown) return
     if (!bootScriptsChanged(bootedScriptKeys, injections)) return
+    if (removedPluginScripts(bootedScriptKeys, injections)) {
+      bootedScriptKeys = undefined
+      void navigateMain(applicationUrl).catch((error: unknown) => { reportFatal(error, 'main') })
+      return
+    }
     bootedScriptKeys = shellScriptKeys(injections)
   }
   const platformView = new DesktopPlatformView(join(app.getAppPath(), 'lib', 'preload-platform-account.cjs'),
@@ -654,7 +660,7 @@ async function main(): Promise<void> {
         // replaces `shellSnapshotHold`, the previous capture must not write over it.
         if (shellSnapshotHold?.state === 'hold') {
           shellSnapshotHold.state = 'discard'
-          shellSnapshotHold.pending = undefined
+          delete shellSnapshotHold.pending
         }
         const snapshotHold: { state: 'hold' | 'commit' | 'discard'; pending?: DesktopShellSnapshot } = {
           state: pluginApply ? 'hold' : 'commit',
@@ -792,7 +798,7 @@ async function main(): Promise<void> {
       pluginApplyDyingFrame = undefined
       if (!replacedPage && shellSnapshotHold?.state === 'hold') {
         shellSnapshotHold.state = 'discard'
-        shellSnapshotHold.pending = undefined
+        delete shellSnapshotHold.pending
       }
       if (hostReady !== undefined && startup === hostReady) startup = undefined
     }
@@ -1012,6 +1018,23 @@ async function main(): Promise<void> {
         const cached = serveCachedShellScript(request, currentShellSnapshot())
         if (cached !== undefined) return Promise.resolve(cached)
         if (url.pathname.startsWith('/plugins')) console.error(`dsh desktop: shell cache miss ${url.pathname}${url.search}`)
+        // Enable and install follow a profile write that restarts the Host.
+        // Answering 503 in that gap is the "启用失败" toast. Wait for the new Host.
+        if (url.pathname.startsWith('/api/pluginManager/')) {
+          return (async () => {
+            const deadline = Date.now() + 20_000
+            while ((backend.host === undefined || hostUrl === undefined || hostCookie === undefined) && Date.now() < deadline && !quitting) {
+              await new Promise((resolve) => setTimeout(resolve, 50))
+            }
+            if (hostUrl === undefined || hostCookie === undefined) return new Response(null, { status: 503 })
+            pluginRequests += 1
+            try {
+              return await forwardWebRequest(rewriteStalePluginRevision(request, pluginRevisions), hostUrl, hostCookie)
+            } finally {
+              pluginRequests -= 1
+            }
+          })()
+        }
         return Promise.resolve(new Response(null, { status: 503 }))
       }
       // A page that painted from the previous launch's snapshot still asks for its on-demand
@@ -1022,7 +1045,25 @@ async function main(): Promise<void> {
       // Count them so `applyInstalledPlugins` restarts the Host only after that sequence has drained.
       if (!url.pathname.startsWith('/api/pluginManager/')) return forwardWebRequest(forwarded, hostUrl, hostCookie)
       pluginRequests += 1
-      return forwardWebRequest(forwarded, hostUrl, hostCookie).finally(() => { pluginRequests -= 1 })
+      let restartWindow = false
+      const pending = forwardWebRequest(forwarded, hostUrl, hostCookie).then(async (response) => {
+        if (!response.ok) return response
+        try {
+          restartWindow = pluginChangeRestartsWindow(url.pathname, await response.clone().json())
+        } catch {
+          // A non-JSON answer does not describe a saved plugin change.
+        }
+        return response
+      })
+      return pending.finally(() => {
+        pluginRequests -= 1
+        // Uninstall, install, and enable used to reload the window from the
+        // package.json watch. Windows often reports only the atomic temp name,
+        // so the watch never ran and the old plugin page stayed up. Reload
+        // from the finished call. applyInstalledPlugins waits out a follow-up
+        // install in the same update.
+        if (restartWindow) void applyInstalledPlugins()
+      })
     }
     return Promise.resolve(new Response(null, { status: 404 }))
   })
