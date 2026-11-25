@@ -67,6 +67,10 @@ apps/desktop/resources/icon.ico
 apps/desktop/scripts/render-app-icons.mjs
 apps/desktop/scripts/render-installer-brand.mjs
 apps/desktop/src/company-market.ts
+apps/desktop/tests/company-market.spec.ts
+packages/boot/plugin-manager/src/company-force-remove.ts
+packages/boot/plugin-manager/src/operations.ts
+packages/boot/plugin-manager/tests/company-force-remove.spec.ts
 apps/desktop/src/local-login.ts
 apps/desktop/src/login-enterprises.ts
 apps/desktop/src/gateway-session-token.ts

@@ -85,6 +85,7 @@ import { DesktopQuitConfirmation } from './quit-confirmation.ts'
 import { DesktopTray } from './tray.ts'
 import { DesktopBackgroundNotice } from './background-notice.ts'
 import {
+  COMPANY_MARKET_NPM,
   companyMarketScript, ensureCompanyMarketProfile, startCompanyMarketBridge, stopCompanyMarketBridge,
 } from './company-market.ts'
 
@@ -620,6 +621,9 @@ async function main(): Promise<void> {
         ...hostEnvironment,
         DSH_HOME: zrDesktopHome(),
         DSH_CLIENT_VERSION: desktopClientVersion(),
+        // Company plugin remove/install must resolve `@zhongruan/*` via the local market bridge.
+        ZR_DSH_COMPANY_NPM: COMPANY_MARKET_NPM,
+        ZR_DSH_MARKET_NPM: COMPANY_MARKET_NPM,
         DSH_BUNDLED_SKILL_DIR: app.isPackaged
           ? join(process.resourcesPath, 'skills')
           : join(app.getAppPath(), 'resources', 'skills'),
