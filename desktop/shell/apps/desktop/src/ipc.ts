@@ -37,6 +37,8 @@ export const DESKTOP_IPC = {
   windowFullscreen: 'dsh-desktop:window-fullscreen',
   windowsAppearance: 'dsh-desktop:windows-appearance',
   windowsMenu: 'dsh-desktop:windows-menu',
+  /** Soft-restart Host + main window after a plugin install/enable/uninstall the UI already confirmed. */
+  applyPlugins: 'dsh-desktop:apply-plugins',
 } as const
 
 /** Desktop release update state rendered by desktop-owned UI. */
@@ -92,6 +94,11 @@ export interface DshDesktopProductApi {
   }
   /** Installed application release version (the DMG/ZIP product version, not the runtime version). */
   appVersion(): Promise<string>
+  /**
+   * Soft-restart the Host and reload the main window so newly enabled plugins appear in the sidebar.
+   * No confirmation dialog — the plugin manager UI already asked.
+   */
+  applyPlugins(): Promise<boolean>
 }
 
 /** Scheme of Desktop-owned application documents. */

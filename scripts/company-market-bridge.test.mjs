@@ -3,7 +3,7 @@ import test from 'node:test'
 import {
   companyDocument, companyHttpFallback, localTarballUrl, npmProxyTarget, packageRegistryUrl,
   pinnedDnsLookup, publicHttpUrl, publicRedirectTarget, publicRedirectUrl, rewritePackumentTarballs,
-  transientNetworkError,
+  transientNetworkError, withoutTrailingVersion,
 } from './company-market-bridge.mjs'
 
 test('package names stay on the registry', () => {
@@ -166,6 +166,15 @@ test('packument tarballs are served from the local bridge', () => {
     publicPackument.versions['1.0.31'].dist.tarball,
     'https://registry.npmmirror.com/@cursor/sdk/-/sdk-1.0.31.tgz',
   )
+})
+
+test('market titles do not keep a trailing version', () => {
+  assert.equal(
+    withoutTrailingVersion('专家·技能·连接器：岗位人设、公司 SOP · 0.1.65'),
+    '专家·技能·连接器：岗位人设、公司 SOP',
+  )
+  assert.equal(withoutTrailingVersion('专家·技能·连接器'), '专家·技能·连接器')
+  assert.equal(withoutTrailingVersion('版本 0.1.65 在句子中间'), '版本 0.1.65 在句子中间')
 })
 
 test('published links are http(s) only', () => {

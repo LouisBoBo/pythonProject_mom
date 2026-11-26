@@ -448,6 +448,11 @@ function titleFromName(name) {
   return short.replace(/^dsh-/, '').replace(/-/g, ' ')
 }
 
+/** Drop a version that was written into a title or description. The card already prints the package version on its own line. */
+export function withoutTrailingVersion(value) {
+  return String(value).replace(/ · \d+\.\d+\.\d+$/u, '')
+}
+
 async function packageMeta(name) {
   return fetchJson(packageRegistryUrl(NPM, name))
 }
@@ -487,16 +492,16 @@ async function buildIndex() {
       ?? '*'
     const desc = row.description ?? {}
     const description = {
-      en: typeof desc === 'string' ? desc : (desc.en ?? manifest.description ?? name),
-      zh: typeof desc === 'string' ? desc : (desc.zh ?? desc.en ?? manifest.description ?? name),
+      en: withoutTrailingVersion(typeof desc === 'string' ? desc : (desc.en ?? manifest.description ?? name)),
+      zh: withoutTrailingVersion(typeof desc === 'string' ? desc : (desc.zh ?? desc.en ?? manifest.description ?? name)),
     }
     const title = {
       en: titleFromName(name),
       zh: titleFromName(name),
     }
     if (manifest.dshMarket) {
-      if (manifest.dshMarket.en) title.en = String(manifest.dshMarket.en).slice(0, 80)
-      if (manifest.dshMarket.zh) title.zh = String(manifest.dshMarket.zh).slice(0, 80)
+      if (manifest.dshMarket.en) title.en = withoutTrailingVersion(manifest.dshMarket.en).slice(0, 80)
+      if (manifest.dshMarket.zh) title.zh = withoutTrailingVersion(manifest.dshMarket.zh).slice(0, 80)
     }
     const page = publicHttpUrl(row.url)
     const source = typeof row.url === 'string' ? publicHttpUrl(row.url.replace(/\.git$/, '')) : undefined

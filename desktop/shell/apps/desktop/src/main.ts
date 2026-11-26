@@ -55,7 +55,7 @@ import {
   writeDesktopShellSnapshot,
   type DesktopShellSnapshot,
 } from './shell-cache.ts'
-import { bootScriptsChanged, pluginChangeRestartsWindow, quarantineShadowedRuntimePackages, removedPluginScripts, sanitizeProfileManifestBom, watchProfilePlugins } from './plugin-visibility.ts'
+import { bootScriptsChanged, quarantineShadowedRuntimePackages, removedPluginScripts, sanitizeProfileManifestBom } from './plugin-visibility.ts'
 import { DesktopFatalRecovery } from './fatal-recovery.ts'
 import { pruneCrashReports, RendererConsoleTail, writeCrashReport, type CrashReportSource } from './crash-report.ts'
 import { mountWelcomeView, type WelcomeSurface } from './welcome-window.ts'
@@ -512,9 +512,8 @@ async function main(): Promise<void> {
    * `discard` drops one when the restart never replaced the page.
    */
   let shellSnapshotHold: { state: 'hold' | 'commit' | 'discard'; pending?: DesktopShellSnapshot } | undefined
-  /** Plugin-manager calls on the wire; the profile watcher must not restart the Host under them. */
+  /** Plugin-manager calls on the wire. Soft restart waits until in-flight calls drain. */
   let pluginRequests = 0
-  let pluginWatch: { close(): void } | undefined
   let applyInstalledPlugins: () => Promise<boolean> = async () => false
   const commitShellSnapshot = (snapshot: DesktopShellSnapshot): void => {
     writeDesktopShellSnapshot(zrDesktopHome(), snapshot)
@@ -655,7 +654,6 @@ async function main(): Promise<void> {
         injections = ready.injections
         pluginRevisions = pluginScriptRevisions(injections)
         refreshRunningShell()
-        if (pluginWatch === undefined) pluginWatch = watchProfilePlugins(paths.profile, () => applyInstalledPlugins())
         // A retry drops the capture still waiting for navigate. Once a newer start
         // replaces `shellSnapshotHold`, the previous capture must not write over it.
         if (shellSnapshotHold?.state === 'hold') {
@@ -803,6 +801,8 @@ async function main(): Promise<void> {
       if (hostReady !== undefined && startup === hostReady) startup = undefined
     }
   }
+  // Plugin manager owns install/uninstall/enable UI. No OS「服务版本变化」box.
+  // Soft restart runs only when the UI calls applyPlugins (立即启用 / 卸载完成), via IPC.
   // The Host starts beside the startup screen. See reconcileBackend.
 
   const updateErrors = new WeakMap<DesktopUpdateState, Promise<void>>()
@@ -1040,32 +1040,19 @@ async function main(): Promise<void> {
       // A page that painted from the previous launch's snapshot still asks for its on-demand
       // chunks under that snapshot's revisions; inside app.asar those differ every launch.
       const forwarded = rewriteStalePluginRevision(request, pluginRevisions)
-      // A change to the profile is written under the Host's package.json lock, and the calls it triggers
-      // (an update's removal, then its installation and enable) arrive within moments of each other.
-      // Count them so `applyInstalledPlugins` restarts the Host only after that sequence has drained.
+      // Count in-flight pluginManager calls so soft restart can wait for the sequence to drain.
       if (!url.pathname.startsWith('/api/pluginManager/')) return forwardWebRequest(forwarded, hostUrl, hostCookie)
       pluginRequests += 1
-      let restartWindow = false
-      const pending = forwardWebRequest(forwarded, hostUrl, hostCookie).then(async (response) => {
-        if (!response.ok) return response
-        try {
-          restartWindow = pluginChangeRestartsWindow(url.pathname, await response.clone().json())
-        } catch {
-          // A non-JSON answer does not describe a saved plugin change.
-        }
-        return response
-      })
-      return pending.finally(() => {
+      return forwardWebRequest(forwarded, hostUrl, hostCookie).finally(() => {
         pluginRequests -= 1
-        // Uninstall, install, and enable used to reload the window from the
-        // package.json watch. Windows often reports only the atomic temp name,
-        // so the watch never ran and the old plugin page stayed up. Reload
-        // from the finished call. applyInstalledPlugins waits out a follow-up
-        // install in the same update.
-        if (restartWindow) void applyInstalledPlugins()
       })
     }
     return Promise.resolve(new Response(null, { status: 404 }))
+  })
+
+  ipcMain.handle(DESKTOP_IPC.applyPlugins, async (event) => {
+    assertProductSender(event)
+    return applyInstalledPlugins()
   })
 
   installDesktopDirectoryPicker(() => mainWindow)
@@ -1335,7 +1322,6 @@ async function main(): Promise<void> {
   }
   powerMonitor.on('resume', automaticCheck)
   app.on('will-quit', () => {
-    pluginWatch?.close()
     updateSchedule.dispose()
     powerMonitor.off('resume', automaticCheck)
     updates.dispose()

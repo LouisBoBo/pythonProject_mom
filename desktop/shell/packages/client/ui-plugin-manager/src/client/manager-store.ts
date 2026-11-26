@@ -37,6 +37,19 @@ import type { PluginTabInstall } from './slot-contract.ts'
 import type { PluginTab } from './tab-ledger.ts'
 import { shortName } from './presentation.ts'
 
+/** Desktop soft-restart after the plugin manager UI already confirmed enable/uninstall. */
+async function applyDesktopPlugins(): Promise<void> {
+  const desktop = (globalThis as {
+    dshDesktop?: { applyPlugins?: () => Promise<boolean> }
+  }).dshDesktop
+  if (desktop?.applyPlugins === undefined) return
+  try {
+    await desktop.applyPlugins()
+  } catch {
+    // Soft restart is best-effort; the enable/uninstall result already landed in the profile.
+  }
+}
+
 /** The action a failed notice names. */
 export type FailedAction = 'enable' | 'disable' | 'uninstall' | 'rowEnable' | 'rowDisable'
 
@@ -300,6 +313,14 @@ export interface ConfirmState {
   readonly packageName: string
 }
 
+/** What the uninstall-done dialog shows after a removal saved. */
+export interface UninstallResultState {
+  readonly packageName: string
+  readonly title: string
+  readonly version?: string
+  readonly description?: string
+}
+
 /** What the tab renders. */
 export interface PluginManagerState {
   /** `unavailable` when the Host runs without a managed profile; `error` keeps the last packages. */
@@ -316,6 +337,8 @@ export interface PluginManagerState {
   readonly notice: ManagerNotice | null
   readonly install: InstallState
   readonly confirm: ConfirmState | null
+  /** Result card after a confirmed uninstall saved; same shape as the install-done wizard. */
+  readonly uninstallResult: UninstallResultState | null
   /** The package the list scrolls to and marks, once an install enabled it. */
   readonly highlight: string | null
 }
@@ -380,6 +403,8 @@ export interface PluginManagerFace {
   uninstall: (packageName: string) => void
   confirm: () => void
   cancelConfirm: () => void
+  /** Close the uninstall-done dialog. */
+  dismissUninstallResult: () => void
   /** Switch one of a bundle's rows on or off in the profile's user layer. */
   setRowEnabled: (entryId: PluginEntryId, enabled: boolean) => void
   dismissNotice: () => void
@@ -615,7 +640,7 @@ export class PluginManagerController {
   ) {
     this.store = createSnapshotStore<PluginManagerState>({
       status: 'idle', refreshStatus: 'idle', packages: [], busy: [], notice: null,
-      install: IDLE_INSTALL, confirm: null, highlight: null,
+      install: IDLE_INSTALL, confirm: null, uninstallResult: null, highlight: null,
     })
   }
 
@@ -693,15 +718,21 @@ export class PluginManagerController {
         void this.runInstall()
       },
       closeInstall: () => {
-        if (isInstallPending(this.getSnapshot().install.phase)) {
+        const install = this.getSnapshot().install
+        if (isInstallPending(install.phase)) {
           this.patchInstall({ open: false })
           void this.cancelInstall()
           return
         }
-        if (this.getSnapshot().install.phase === 'checking') this.finishAnalytics('cancelled')
+        if (install.phase === 'checking') this.finishAnalytics('cancelled')
+        // Catalog update / already-selected install shows「完成」instead of「立即启用」.
+        // Soft-restart when the Host said restart-required, or when the catalog already applied selection.
+        const softRestart = install.phase === 'done'
+          && (install.restartRequired || install.subject?.selection !== undefined)
         this.abortInspect()
         this.registryRead = undefined
         this.patch({ install: IDLE_INSTALL })
+        if (softRestart) void applyDesktopPlugins()
       },
       editInstallSpec: (text) => {
         const install = this.getSnapshot().install
@@ -783,14 +814,34 @@ export class PluginManagerController {
         })
       },
       uninstall: (packageName) => {
+        const pkg = this.getSnapshot().packages.find(item => item.name === packageName)
+        const resolvedTitle = pkg?.meta?.title === undefined ? undefined : resolveText(pkg.meta.title)
+        const title = resolvedTitle === undefined || resolvedTitle === '' ? packageName : resolvedTitle
+        const description = pkg?.meta?.description === undefined ? pkg?.description
+          : (resolveText(pkg.meta.description) || pkg.description)
+        const resultCard: UninstallResultState = {
+          packageName,
+          title,
+          ...pkg?.version === undefined ? {} : { version: pkg.version },
+          ...description === undefined || description === '' ? {} : { description },
+        }
         this.pendingConfirm = () => this.run(packageName, { packageName, action: 'uninstall' }, async () => {
           this.ctx.get('productAnalytics')?.track('confirm_uninstall_plugin', { plugin_name: packageName })
-          this.applied(await this.ctx.remote.pluginManager.removeBundle(packageName), packageName)
+          const answer = await this.ctx.remote.pluginManager.removeBundle(packageName)
+          this.applied(answer, packageName)
+          if (answer.ok && (answer.value.application === 'applied' || answer.value.application === 'restart-required'
+            || answer.value.application === 'overridden')) {
+            this.patch({ uninstallResult: resultCard })
+          }
         })
         this.patch({ confirm: { action: 'uninstall', packageName } })
       },
       confirm: () => { void this.confirm() },
       cancelConfirm: () => { this.pendingConfirm = undefined; this.patch({ confirm: null }) },
+      dismissUninstallResult: () => {
+        this.patch({ uninstallResult: null })
+        void applyDesktopPlugins()
+      },
       setRowEnabled: (entryId, enabled) => {
         void this.run(rowKey(entryId), { packageName: entryId, action: enabled ? 'rowEnable' : 'rowDisable' }, async () => {
           const result = await this.ctx.remote.pluginManager.setPluginEnabled(entryId, enabled)
@@ -1347,8 +1398,7 @@ export class PluginManagerController {
     this.patchInstall({ enabling: true })
     if (name !== null) {
       let result = await this.ctx.remote.pluginManager.setBundleEnabled(name, true)
-      // The install changed the profile, and the shell restarts the Host to pick that up: its 503 means
-      // "not listening yet", not a refusal, so the enable waits for it instead of toasting a failure.
+      // The install changed the profile; soft restart may briefly 503 while the Host comes back.
       for (let attempt = 0; !result.ok && /HTTP 50[34]/.test(result.error.message) && attempt < 6 && !this.disposed; attempt += 1) {
         await new Promise(resolve => setTimeout(resolve, 500))
         if (this.disposed) return
@@ -1363,6 +1413,9 @@ export class PluginManagerController {
       }
     }
     this.patch({ install: IDLE_INSTALL, highlight: name })
+    // Real Host + window soft restart so the new client sidebar entries appear (not location.reload).
+    await applyDesktopPlugins()
+    if (this.disposed) return
     await this.load()
   }
 

@@ -115,7 +115,7 @@ export function removedPluginScripts(booted: readonly string[] | undefined, inje
   return false
 }
 
-const WINDOW_RESTART_METHODS = new Set(['removeBundle', 'installBundle'])
+const WINDOW_RESTART_METHODS = new Set(['removeBundle', 'installBundle', 'setBundleEnabled'])
 
 /**
  * Plugin-manager method named by a desktop API path, such as `/api/pluginManager/removeBundle`.
@@ -131,15 +131,17 @@ export function pluginManagerMethod(pathname: string): string | undefined {
 
 function changeWasSaved(body: unknown): boolean {
   if (typeof body !== 'object' || body === null) return false
-  const record = body as { ok?: unknown, value?: unknown, application?: unknown, changed?: unknown }
+  const record = body as { ok?: unknown, value?: unknown, result?: unknown, application?: unknown, changed?: unknown }
   if (record.application === 'applied' || record.application === 'restart-required' || record.changed === true) return true
-  return record.ok === true && changeWasSaved(record.value)
+  if (record.ok === true && changeWasSaved(record.value)) return true
+  // The Host answers `{ type: 'server-response', result: { ok, value } }`, not the change itself.
+  return changeWasSaved(record.result)
 }
 
 /**
- * Whether this plugin-manager response should reload the open window.
- * Install, uninstall, and enable write the profile and used to restart the
- * window from the package.json watch. A row toggle only edits the user patch.
+ * Whether this plugin-manager response should ask the user to restart.
+ * Install, uninstall, and the plugin enable switch save the profile. The window
+ * stays as it is until the user confirms. A row toggle inside a plugin does not ask.
  * @param pathname - Request path.
  * @param body - JSON answer, either the change itself or `{ ok, value }`.
  */

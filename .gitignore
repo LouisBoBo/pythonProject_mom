@@ -8,6 +8,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+desktop/shell/apps/desktop/.desktop-build/
 .env
 .tmp/
 var/

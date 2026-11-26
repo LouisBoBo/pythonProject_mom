@@ -1,33 +1,43 @@
 ---
-description: 插件安装、卸载、更新已测过，没有新 bug 就不要改
+description: 插件安装、卸载、更新已锁定，没有重大 bug 禁止改动
 alwaysApply: true
 ---
 
-# 插件安装、卸载、更新已冻结
+# 插件安装、卸载、更新已锁定
 
-2026-11-25 本机测过安装、卸载、更新，三步都通过。用户没有指出这三步的新 bug 时，禁止改它们的行为，也禁止顺手重构。
+2026-11-26 本机再次测过安装、卸载、更新（含完成弹框与软重启）。**没有重大 bug 时禁止改这些行为，也禁止顺手重构、顺手「优化」、顺手改文案。**
 
 ## 冻结范围
 
-- `desktop/shell/apps/desktop/src/main.ts`：`applyInstalledPlugins`、`pluginRequests` 等待、`/api/pluginManager/` 在 Host 未就绪时最多等 20 秒
-- `desktop/shell/apps/desktop/src/plugin-visibility.ts`：`WINDOW_RESTART_METHODS`、`changeWasSaved`、`watchProfilePlugins`
+- `desktop/shell/apps/desktop/src/main.ts`：`applyInstalledPlugins`、`pluginRequests` 等待、`/api/pluginManager/` 在 Host 未就绪时最多等 20 秒、`DESKTOP_IPC.applyPlugins` 处理
+- `desktop/shell/apps/desktop/src/ipc.ts`、`preload-app.ts`：`applyPlugins` 通道与 `dshDesktop.applyPlugins`
+- `desktop/shell/apps/desktop/src/plugin-visibility.ts`：`WINDOW_RESTART_METHODS`、`changeWasSaved`。不要把 profile 监听再接回自动重启；不要恢复 OS 重启提示框
+- `desktop/shell/packages/client/ui-plugin-manager/src/client/manager-store.ts`：`applyDesktopPlugins`、`closeInstall` 软重启条件、`enableInstalled`、`uninstall` / `confirm` / `dismissUninstallResult`、`uninstallResult`
+- `desktop/shell/packages/client/ui-plugin-manager/src/client/PluginManagerPage.tsx`：安装完成「立即启用」、更新完成「完成」、卸载确认 `ConfirmDialog`（含防穿透关闭）、卸载完成「已卸载」
 - `desktop/shell/packages/boot/plugin-manager/src/index.ts` 的 `reload()`，以及 `activation-reload.ts`：裸的 `failed to import` 记为 `restart-required`
 - `@zhongruan/*` 卸载不因 `bundle-in-use` 被拒绝
 
 ## 必须保持
 
-- `setBundleEnabled` 不重启窗口。Host 还没就绪时等待，不立刻回 503。
-- 只有 `removeBundle` 和 `installBundle` 会重启窗口。
-- 更新是先卸后装。热重载只报 `failed to import`、后面没有冒号时，结果是 `restart-required`（界面为已安装），不是 `failed`。
+- `installBundle` / `removeBundle` / `setBundleEnabled` 保存成功后：**不**自动重启窗口，**不**弹系统原生「服务版本变化」message box（会盖住插件管理器自己的完成框）。不要再用自定义 update-dialog 叠层。Host 未就绪时等待，不立刻回 503。
+- 真正软重启只走桌面 `dshDesktop.applyPlugins` → `applyInstalledPlugins`（停 Host、再起、重载主窗口）。禁止只 `location.reload`。触发点仅限：
+  - 安装完成点「立即启用」（`enableInstalled`）
+  - 更新完成点「完成」（`closeInstall`，且 `restartRequired` 或 catalog `selection` 已写入）
+  - 关闭卸载完成框（`dismissUninstallResult`）
+- 卸载必须先出确认框「卸载 xxx？」（`ConfirmDialog`），确认后才 `removeBundle`；成功后出与安装完成同风格的「已卸载」框（`uninstallResult`）。确认框打开后短时间内忽略遮罩误点关闭（防点击穿透）。
+- 安装、卸载、更新不会在 API 返回时自动重启。更新先卸后装。插件内部某一行的开关不弹框。
+- 热重载只报 `failed to import`、后面没有冒号时，结果是 `restart-required`（界面为已安装），不是 `failed`。
 - `failed to import:` 后面带具体错误时，仍然算安装失败。
 - 写进 Profile `package.json` 的版本，市场上必须已有对应 tgz。
 
 ## 允许改的唯一情况
 
-用户明确说安装、卸载或更新又坏了，并给出这次的报错原文。只改对上那条报错的一处。改完必须再测安装、卸载、更新。
+用户明确说安装、卸载或更新又坏了，并判定为**重大 bug**（流程走不通、侧栏不生效、弹框完全出不来、误自动重启等），且给出本次现象或报错原文。只改对上那一处。改完必须再测安装、卸载、更新三步。
 
 ```text
-❌ 清理 main.ts 时改掉 Host 等待或重启名单
+❌ 没有重大 bug 时改弹框文案、样式、时序「微调」
+❌ 清理 / 重构 main.ts、manager-store、PluginManagerPage 时顺手改生命周期
+❌ 把 API 成功后又接回自动重启或系统「服务版本变化」框
 ❌ 把裸的 failed to import 重新当成安装失败
-✅ 用户贴出新的失败原文后，只改对应分支，并重测三步
+✅ 用户指出重大 bug 并给出原文后，只改对应分支，并重测三步
 ```

@@ -56,13 +56,22 @@ describe('profile plugin signature', () => {
     expect(removedPluginScripts(booted, [])).toBe(false)
   })
 
-  it('reloads the window after a saved install or uninstall', () => {
+  it('asks once after a saved install, uninstall, or enable', () => {
     const saved = { ok: true, value: { application: 'applied', changed: true, stage: 'remove' } }
     expect(pluginChangeRestartsWindow('/api/pluginManager/removeBundle', saved)).toBe(true)
     expect(pluginChangeRestartsWindow('/api/pluginManager/installBundle', { application: 'restart-required', changed: true })).toBe(true)
-    expect(pluginChangeRestartsWindow('/api/pluginManager/setBundleEnabled', { ok: true, value: { application: 'applied' } })).toBe(false)
+    expect(pluginChangeRestartsWindow('/api/pluginManager/setBundleEnabled', { ok: true, value: { application: 'applied' } })).toBe(true)
+    expect(pluginChangeRestartsWindow('/api/pluginManager/setBundleEnabled', { ok: true, value: { application: 'failed', changed: false } })).toBe(false)
     expect(pluginChangeRestartsWindow('/api/pluginManager/removeBundle', { ok: true, value: { application: 'failed', changed: false, error: { code: 'bundle-in-use' } } })).toBe(false)
     expect(pluginChangeRestartsWindow('/api/pluginManager/setPluginEnabled', saved)).toBe(false)
+    const envelope = { type: 'server-response', result: { ok: true, value: { application: 'applied', changed: true } } }
+    expect(pluginChangeRestartsWindow('/api/pluginManager/removeBundle', envelope)).toBe(true)
+    expect(pluginChangeRestartsWindow('/api/pluginManager/installBundle', {
+      type: 'server-response', result: { ok: true, value: { application: 'restart-required', changed: true } },
+    })).toBe(true)
+    expect(pluginChangeRestartsWindow('/api/pluginManager/installBundle', {
+      type: 'server-response', result: { ok: true, value: { application: 'failed', changed: false } },
+    })).toBe(false)
     expect(pluginChangeRestartsWindow('/api/sessions/list', saved)).toBe(false)
   })
 
