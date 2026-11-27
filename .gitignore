@@ -14,3 +14,5 @@ desktop/shell/apps/desktop/.desktop-build/
 var/
 .codex-tasks/
 desktop/update-upload.env
+
+node_modules/

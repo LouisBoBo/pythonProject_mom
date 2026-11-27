@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  companyDocument, companyHttpFallback, localTarballUrl, npmProxyTarget, packageRegistryUrl,
-  pinnedDnsLookup, publicHttpUrl, publicRedirectTarget, publicRedirectUrl, rewritePackumentTarballs,
-  transientNetworkError, withoutTrailingVersion,
+  companyDocument, companyHttpFallback, createNpmResponseCache, isPackumentCachePath,
+  localTarballUrl, npmProxyTarget, packageRegistryUrl, pinnedDnsLookup, publicHttpUrl,
+  publicRedirectTarget, publicRedirectUrl, rewritePackumentTarballs, shouldProxyNpmPath,
+  transientNetworkError, upstreamTimeoutMs, withoutTrailingVersion,
 } from './company-market-bridge.mjs'
 
 test('package names stay on the registry', () => {
@@ -27,6 +28,11 @@ test('company packages stay on the company registry and other dependencies use t
   )
   assert.throws(() => npmProxyTarget('/npm/../admin', company, publicRegistry))
   assert.throws(() => npmProxyTarget('/health', company, publicRegistry))
+  assert.equal(shouldProxyNpmPath('/npm/@zhongruan%2Fdsh-mom-docs'), true)
+  assert.equal(shouldProxyNpmPath('/npm/@zhongruan/dsh-mom-docs/-/dsh-mom-docs-0.1.9.tgz'), true)
+  assert.equal(shouldProxyNpmPath('/npm/zod'), false)
+  assert.equal(shouldProxyNpmPath('/npm/@deepseek-ai%2Fdsh-timeout'), false)
+  assert.equal(shouldProxyNpmPath('/npm/@cursor%2Fsdk'), false)
 })
 
 test('registry redirects stay on public http(s) hosts', () => {
@@ -181,4 +187,41 @@ test('published links are http(s) only', () => {
   assert.equal(publicHttpUrl('https://github.com/acme/plugin.git'), 'https://github.com/acme/plugin.git')
   assert.equal(publicHttpUrl('javascript:alert(1)'), undefined)
   assert.equal(publicHttpUrl('https://user:secret@example.com/plugin'), undefined)
+})
+
+test('only packument paths are cacheable; tarballs are not', () => {
+  assert.equal(isPackumentCachePath('/npm/zod'), true)
+  assert.equal(isPackumentCachePath('/npm/@zhongruan%2Fdsh-mom-docs'), true)
+  assert.equal(isPackumentCachePath('/npm/zod/-/zod-3.0.0.tgz'), false)
+  assert.equal(isPackumentCachePath('/npm/@zhongruan/dsh-mom-docs/-/dsh-mom-docs-0.1.9.tgz'), false)
+  assert.equal(isPackumentCachePath('/health'), false)
+})
+
+test('packument cache returns a hit inside the TTL and misses after expiry', () => {
+  const cache = createNpmResponseCache({ ttlMs: 1_000, maxEntries: 8 })
+  const body = Buffer.from('{"name":"zod"}')
+  cache.set('/npm/zod', { status: 200, contentType: 'application/json', body }, 1_000)
+  const hit = cache.get('/npm/zod', 1_500)
+  assert.equal(hit?.status, 200)
+  assert.equal(hit?.contentType, 'application/json')
+  assert.equal(Buffer.compare(hit.body, body), 0)
+  assert.equal(cache.get('/npm/zod', 2_100), undefined)
+})
+
+test('packument cache drops the oldest entry when full', () => {
+  const cache = createNpmResponseCache({ ttlMs: 10_000, maxEntries: 2 })
+  cache.set('/npm/a', { status: 200, contentType: 'application/json', body: Buffer.from('a') }, 1)
+  cache.set('/npm/b', { status: 200, contentType: 'application/json', body: Buffer.from('b') }, 2)
+  cache.set('/npm/c', { status: 200, contentType: 'application/json', body: Buffer.from('c') }, 3)
+  assert.equal(cache.get('/npm/a', 4), undefined)
+  assert.equal(cache.get('/npm/b', 4)?.body.toString(), 'b')
+  assert.equal(cache.get('/npm/c', 4)?.body.toString(), 'c')
+})
+
+test('upstream timeout defaults to fifteen seconds and accepts a positive override', () => {
+  assert.equal(upstreamTimeoutMs(undefined), 15_000)
+  assert.equal(upstreamTimeoutMs('8000'), 8_000)
+  assert.equal(upstreamTimeoutMs('0'), 15_000)
+  assert.equal(upstreamTimeoutMs('-1'), 15_000)
+  assert.equal(upstreamTimeoutMs('nope'), 15_000)
 })

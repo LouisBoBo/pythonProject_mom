@@ -124,3 +124,4 @@ packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx
 packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
 packages/client/ui-plugin-manager/src/client/PluginManagerPage.tsx
 packages/client/ui-plugin-manager/src/client/locales.ts
+packages/client/ui-plugin-manager/tests/components.client.spec.tsx

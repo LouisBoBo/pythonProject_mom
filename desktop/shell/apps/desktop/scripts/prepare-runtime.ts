@@ -38,7 +38,10 @@ async function prepareElectron({ platform, arch }: DesktopTarget): Promise<strin
   const { version } = require('electron/package.json') as { version: string }
   const fileName = electronArchiveName(version, platform, arch)
   const checksumFile = join(BUILD_PATHS.downloads, `${fileName}.sha256`)
-  const savedChecksum = existsSync(checksumFile) ? readFileSync(checksumFile, 'utf8').trim().split(/\s+/)[0] : ''
+  // split()[0] is string|undefined under noUncheckedIndexedAccess; keep a definite string for checksums.
+  const savedChecksum = existsSync(checksumFile)
+    ? (readFileSync(checksumFile, 'utf8').trim().split(/\s+/)[0] ?? '')
+    : ''
   // A saved checksum lets @electron/get reuse the local zip. Without it, every
   // package re-downloads SHASUMS256.txt even when the archive is already cached.
   const archive = await packagingStep(process.env.DSH_DESKTOP_PACKAGING_RUN_DIR, 'download:electron',

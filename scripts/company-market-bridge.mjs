@@ -28,6 +28,84 @@ const PORT = Number(process.env.ZR_DSH_MARKET_PORT ?? '13090')
 const LOCAL_NPM = `http://${HOST}:${PORT}/npm/`
 const OUT = process.env.ZR_DSH_MARKET_OUT
   ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'var', 'company-market', 'index.json')
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 15_000
+const DEFAULT_PACKUMENT_TTL_MS = 120_000
+const DEFAULT_PACKUMENT_CACHE_ENTRIES = 256
+const UPSTREAM_TIMEOUT_MS = upstreamTimeoutMs(process.env.ZR_DSH_MARKET_FETCH_TIMEOUT_MS)
+const PACKUMENT_TTL_MS = Number(process.env.ZR_DSH_MARKET_PACKUMENT_TTL_MS ?? DEFAULT_PACKUMENT_TTL_MS)
+const PACKUMENT_CACHE_ENTRIES = Number(process.env.ZR_DSH_MARKET_PACKUMENT_CACHE_ENTRIES ?? DEFAULT_PACKUMENT_CACHE_ENTRIES)
+
+/**
+ * Bound one upstream registry fetch so a hung mirror cannot pin the installer for minutes.
+ * @param {string | undefined} raw
+ * @returns {number}
+ */
+export function upstreamTimeoutMs(raw) {
+  const value = Number(raw)
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_UPSTREAM_TIMEOUT_MS
+  return Math.floor(value)
+}
+
+/**
+ * Packument metadata may be cached. Tarball paths under `/-/` must stay live.
+ * @param {string} path
+ * @returns {boolean}
+ */
+export function isPackumentCachePath(path) {
+  if (!path.startsWith('/npm/')) return false
+  if (path.includes('/-/')) return false
+  return path.length > '/npm/'.length
+}
+
+/**
+ * Short-lived in-memory cache for rewritten packument bodies during one install storm.
+ * @param {{ ttlMs?: number, maxEntries?: number }} [options]
+ */
+export function createNpmResponseCache(options = {}) {
+  const ttlMs = options.ttlMs ?? DEFAULT_PACKUMENT_TTL_MS
+  const maxEntries = options.maxEntries ?? DEFAULT_PACKUMENT_CACHE_ENTRIES
+  /** @type {Map<string, { at: number, status: number, contentType: string, body: Buffer }>} */
+  const entries = new Map()
+  return {
+    get(path, now = Date.now()) {
+      const hit = entries.get(path)
+      if (hit === undefined) return undefined
+      if (now - hit.at >= ttlMs) {
+        entries.delete(path)
+        return undefined
+      }
+      // Refresh insertion order so hot packuments survive eviction.
+      entries.delete(path)
+      entries.set(path, hit)
+      return { status: hit.status, contentType: hit.contentType, body: hit.body }
+    },
+    set(path, value, now = Date.now()) {
+      if (entries.has(path)) entries.delete(path)
+      entries.set(path, {
+        at: now,
+        status: value.status,
+        contentType: value.contentType,
+        body: Buffer.from(value.body),
+      })
+      while (entries.size > maxEntries) {
+        const oldest = entries.keys().next().value
+        if (oldest === undefined) break
+        entries.delete(oldest)
+      }
+    },
+  }
+}
+
+const npmResponseCache = createNpmResponseCache({
+  ttlMs: Number.isFinite(PACKUMENT_TTL_MS) && PACKUMENT_TTL_MS > 0 ? PACKUMENT_TTL_MS : DEFAULT_PACKUMENT_TTL_MS,
+  maxEntries: Number.isFinite(PACKUMENT_CACHE_ENTRIES) && PACKUMENT_CACHE_ENTRIES > 0
+    ? Math.floor(PACKUMENT_CACHE_ENTRIES)
+    : DEFAULT_PACKUMENT_CACHE_ENTRIES,
+})
+
+function upstreamSignal(timeoutMs = UPSTREAM_TIMEOUT_MS) {
+  return AbortSignal.timeout(timeoutMs)
+}
 
 async function fetchJson(url) {
   const res = await fetchCompanyFirst(url, 'application/json')
@@ -37,15 +115,23 @@ async function fetchJson(url) {
 
 async function fetchCompanyFirst(url, accept) {
   try {
-    const res = await fetch(url, { headers: { accept, 'accept-encoding': 'identity' }, redirect: 'error' })
+    const res = await fetch(url, {
+      headers: { accept, 'accept-encoding': 'identity' },
+      redirect: 'error',
+      signal: upstreamSignal(),
+    })
     if (res.status < 500) return res
     await res.body?.cancel()
   } catch (error) {
-    if (!transientNetworkError(error)) throw error
+    if (!transientNetworkError(error) && !(error instanceof Error && error.name === 'TimeoutError')) throw error
   }
   const fallback = companyHttpFallback(url)
   if (fallback === undefined) throw new Error(`${url} → company registry failed`)
-  const res = await fetch(fallback, { headers: { accept, 'accept-encoding': 'identity' }, redirect: 'error' })
+  const res = await fetch(fallback, {
+    headers: { accept, 'accept-encoding': 'identity' },
+    redirect: 'error',
+    signal: upstreamSignal(),
+  })
   const body = Buffer.from(await res.arrayBuffer())
   if (!companyDocument(res.headers.get('content-type'), body)) {
     throw new Error('company http fallback was not a package document')
@@ -116,6 +202,19 @@ export function npmProxyTarget(requestPath, companyRegistry = NPM, publicRegistr
     throw new Error('rejected npm path')
   }
   return target.href
+}
+
+/**
+ * Only `@zhongruan/*` must be proxied through this process (company TLS + HTTP fallback).
+ * Everything else is redirected to the public registry so pnpm talks to npmmirror directly.
+ * @param {string} requestPath
+ * @returns {boolean}
+ */
+export function shouldProxyNpmPath(requestPath) {
+  if (!requestPath.startsWith('/npm/')) return false
+  let decoded
+  try { decoded = decodeURIComponent(requestPath.slice('/npm/'.length)) } catch { return false }
+  return decoded.startsWith('@zhongruan/')
 }
 
 const TRANSIENT_NETWORK_CODES = new Set([
@@ -355,15 +454,20 @@ export function pinnedDnsLookup(addresses) {
   }
 }
 
-function fetchPinned(target, accept, addresses) {
+function fetchPinned(target, accept, addresses, signal = upstreamSignal()) {
   const url = new URL(target)
   const request = url.protocol === 'https:' ? httpsRequest : httpRequest
   const lookup = pinnedDnsLookup(addresses)
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason instanceof Error ? signal.reason : new Error('upstream aborted'))
+      return
+    }
     const req = request(url, {
       method: 'GET',
       headers: { accept, 'accept-encoding': 'identity' },
       lookup,
+      signal,
     }, (incoming) => {
       const headers = new Headers()
       for (const [key, value] of Object.entries(incoming.headers)) {
@@ -394,9 +498,10 @@ async function fetchPublicHops(target, accept) {
   for (let hop = 0; hop < 5; hop += 1) {
     // The configured registry is fetched as given, including an operator-chosen
     // internal host. A redirect is connected only to the addresses just checked.
+    const signal = upstreamSignal()
     const upstream = pin === undefined
-      ? await fetch(current, { headers: { accept }, redirect: 'manual' })
-      : await fetchPinned(current, accept, pin)
+      ? await fetch(current, { headers: { accept }, redirect: 'manual', signal })
+      : await fetchPinned(current, accept, pin, signal)
     if (upstream.status < 300 || upstream.status >= 400) return upstream
     const location = upstream.headers.get('location')
     await upstream.body?.cancel()
@@ -408,7 +513,12 @@ async function fetchPublicHops(target, accept) {
   throw new Error('rejected redirect')
 }
 
-async function fetchPublic(target, accept) {
+function retryableUpstream(error) {
+  return transientNetworkError(error)
+    || (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError'))
+}
+
+async function fetchPublicOnce(target, accept) {
   const companyOrigin = new URL(NPM).origin
   let targetOrigin = ''
   try { targetOrigin = new URL(target).origin } catch { /* handled by the hop fetch */ }
@@ -418,7 +528,7 @@ async function fetchPublic(target, accept) {
     if (!canFallBack || upstream.status < 500) return upstream
     await upstream.body?.cancel()
   } catch (error) {
-    if (!canFallBack || !transientNetworkError(error)) throw error
+    if (!canFallBack || !retryableUpstream(error)) throw error
   }
   const fallback = companyHttpFallback(target)
   const upstream = await fetchPublicHops(fallback, accept)
@@ -430,6 +540,16 @@ async function fetchPublic(target, accept) {
     status: upstream.status,
     headers: { 'content-type': upstream.headers.get('content-type') ?? 'application/octet-stream' },
   })
+}
+
+/** One quick retry after a transient public-registry failure, before answering 502 to pnpm. */
+async function fetchPublic(target, accept) {
+  try {
+    return await fetchPublicOnce(target, accept)
+  } catch (error) {
+    if (!retryableUpstream(error)) throw error
+    return fetchPublicOnce(target, accept)
+  }
 }
 
 /** http(s) link safe to publish, or undefined when the catalog value is not one. */
@@ -615,6 +735,30 @@ if (invokedDirectly) {
     }
     if (req.method === 'GET' && path.startsWith('/npm/')) {
       const target = npmProxyTarget(path)
+      // Public packages: send pnpm straight to npmmirror. Proxying them here doubles latency
+      // and turns a slow mirror into 502 storms under concurrent resolve.
+      if (!shouldProxyNpmPath(path)) {
+        res.writeHead(302, {
+          location: target,
+          'cache-control': 'public, max-age=60',
+          'access-control-allow-origin': '*',
+        })
+        res.end()
+        return
+      }
+      if (isPackumentCachePath(path)) {
+        const hit = npmResponseCache.get(path)
+        if (hit !== undefined) {
+          res.writeHead(hit.status, {
+            'content-type': hit.contentType,
+            'cache-control': 'public, max-age=60',
+            'content-length': String(hit.body.length),
+            'x-company-market-cache': 'hit',
+          })
+          res.end(hit.body)
+          return
+        }
+      }
       const upstream = await fetchPublic(target, req.headers.accept ?? '*/*')
       const type = upstream.headers.get('content-type') ?? 'application/octet-stream'
       let body = Buffer.from(await upstream.arrayBuffer())
@@ -629,10 +773,15 @@ if (invokedDirectly) {
           // A non-packument JSON body is forwarded as the registry sent it.
         }
       }
+      const cacheable = upstream.ok && isPackumentCachePath(path) && contentType.includes('json')
+      if (cacheable) {
+        npmResponseCache.set(path, { status: upstream.status, contentType, body })
+      }
       res.writeHead(upstream.status, {
         'content-type': contentType,
-        'cache-control': 'no-store',
+        'cache-control': cacheable ? 'public, max-age=60' : 'no-store',
         'content-length': String(body.length),
+        ...cacheable ? { 'x-company-market-cache': 'miss' } : {},
       })
       res.end(body)
       return
